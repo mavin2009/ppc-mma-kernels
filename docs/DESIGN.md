@@ -106,13 +106,51 @@ timings are at best a dynamic-instruction-count proxy (v2 measured ~23%
 below v1 on it), and are structurally blind to v3's latency-hiding and
 prefetch benefits. Rank v2 vs v3 on silicon.
 
+## v4: production API and GEMV
+
+v4 restructures the same kernels behind a production-shaped API,
+retiring the debt items above: `qbit_repack_q1/q2()` performs the
+bit-unpack + MMA-layout transform once for the whole weight matrix (in
+ggml this runs at model load in `repack.cpp`); `qbit_pack_b()` packs
+activations once, shared across threads; `qbit_gemm_packed()` consumes
+both. For token generation (n <= 2), `qbit_gemv_q1/q2()` switch to a
+select-and-sum path that reads the RAW 1/2-bit weights — GEMV is
+memory-bandwidth-bound, and raw bits are 8×/4× less traffic than
+unpacked int8. It exploits the same algebra with masks instead of
+multiplies (`2·Σ_{bit=1}y − Σy`; ternary via the two code-bit masks),
+with per-chunk activation sums shared across all rows: the inner loop
+contains no multiply instructions at all. Under the qemu
+instruction-count proxy the GEMV path is already ~1.6× cheaper than the
+packed GEMM at n = 1 (m = 4096, k = 2048), before its bandwidth
+advantage — invisible to emulation — applies.
+
+## Q4_K × Q8_K: extending to K-quants
+
+`Q4_K` (superblocks of 256 = 8 sub-blocks of 32; value = d·sc_sub·q −
+dmin·m_sub, unsigned nibbles) maps onto the identical architecture:
+
+- q ∈ 0..15 is natively unsigned → unsigned GER operand, exactly like
+  the v3 code formulation; no flips, no per-row corrections;
+- the per-sub-block scale d·sc replaces v3's per-block dA in the chunk
+  fixup — structurally identical, indexed per chunk;
+- the mins term **is** the separable correction:
+  `corr(i,j) = Σ_sub (dmin_i·m_sub)·(dB_j·S_sub(j))`, and S_sub comes
+  free from `Q8_K`'s precomputed `bsums`. dB·S is folded per (col,
+  chunk) in the activation pack; the kernel applies one `vec_nmsub` per
+  (col, rowgroup, chunk).
+
+The nibble unpack (and 0xF / shift 4) is cheaper than the 1/2-bit
+unpacks. Verified against an exact double reference across the same
+shape matrix (max normalized error ~2e-6). Q5_K and Q6_K follow the
+same recipe (q ∈ 0..31 / 0..63, still unsigned, still int8-safe against
+int8 activations in the rank-4 GER); Q2_K adds per-sub mins the same
+way. These are the natural next kernels.
+
 ## Known limitations / future work
 
-- Weight packing should move to ggml's `repack.cpp` (once, at model
-  load); activation packing should be shared across threads next to
-  activation quantization rather than duplicated per thread.
+- (retired in v4) Weight packing moved behind a one-time repack API;
+  activation packing shared. Remaining: land these inside ggml itself.
 - K tails (k not a multiple of 128) are unsupported, matching the
   formats' block size.
-- An alternative m = 1 (token generation) path using select/`vsum4s`
-  (no multiplies, exploiting ±1 weights) may beat outer-product MMA for
-  single-column GEMV; unbenchmarked.
+- (retired in v4) GEMV path implemented; needs hardware benchmarking
+  against the GEMM path to set the crossover point.
