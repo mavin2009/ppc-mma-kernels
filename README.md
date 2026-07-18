@@ -10,6 +10,8 @@ Mainline llama.cpp accelerates `Q4_0`/`Q8_0` matmuls on Power10 via MMA
 code — throwing away Power's main trick on exactly the layers that
 dominate compute. These kernels close that gap.
 
+**Topics**: `power10` `power11` `ppc64le` `ibm-power` `mma` `matrix-multiply-assist` `gemm` `simd-kernels` `vsx` `altivec` `llama-cpp` `ggml` `gguf` `quantization` `low-bit-inference` `llm-inference` `bitnet` `ternary-networks` `cross-compilation` `qemu`
+
 ## Kernels
 
 | File | What it is |
