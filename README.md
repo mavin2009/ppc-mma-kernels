@@ -20,6 +20,9 @@ dominate compute. These kernels close that gap.
 | `src/qbit_ppc_mma_v3.cpp` | v3: unified `Q1_0`+`Q2_0`, unsigned-code formulation with separable correction, 16x8 tile on all 8 accumulators |
 | `src/qbit_ppc_mma_v4.cpp` | v4: production API — one-time weight repack, shared activation pack, raw-weight GEMV path for token generation |
 | `src/q4_k_ppc_mma.cpp` | `Q4_K` × `Q8_K` (first K-quant kernel): unsigned nibbles + separable mins correction via `bsums`, same 16x8/8-acc architecture |
+| `src/q5_k_ppc_mma.cpp` | `Q5_K` × `Q8_K`: Q4_K structure + 5th bit from `qh` |
+| `src/q6_k_ppc_mma.cpp` | `Q6_K` × `Q8_K`: 16-deep chunks (per-16 scales); offset correction folds into the main FMA |
+| `src/q2_k_ppc_mma.cpp` | `Q2_K` × `Q8_K`: 16-deep chunks, per-16 scale+min pairs |
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the derivation and the
 microarchitectural rationale, [docs/INTEGRATION.md](docs/INTEGRATION.md)

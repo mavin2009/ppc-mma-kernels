@@ -12,7 +12,7 @@ CXXFLAGS := -O3 -mcpu=power10 -Wall -Wextra
 
 BUILD := build
 
-TESTS := $(BUILD)/q1_v1_test $(BUILD)/q2_v1_test $(BUILD)/q1_v2_test $(BUILD)/qbit_v3_test $(BUILD)/qbit_v4_test $(BUILD)/q4_k_test
+TESTS := $(BUILD)/q1_v1_test $(BUILD)/q2_v1_test $(BUILD)/q1_v2_test $(BUILD)/qbit_v3_test $(BUILD)/qbit_v4_test $(BUILD)/q4_k_test $(BUILD)/q5_k_test $(BUILD)/q6_k_test $(BUILD)/q2_k_test
 BENCH := $(BUILD)/q1_v2_bench $(BUILD)/qbit_v3_bench $(BUILD)/qbit_v4_bench
 
 all: $(TESTS) $(BENCH)
@@ -43,6 +43,15 @@ $(BUILD)/qbit_v4_test: src/qbit_ppc_mma_v4.cpp | $(BUILD)
 
 $(BUILD)/q4_k_test: src/q4_k_ppc_mma.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) -DQ4K_TEST $< -o $@
+
+$(BUILD)/q5_k_test: src/q5_k_ppc_mma.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -DQ5K_TEST $< -o $@
+
+$(BUILD)/q6_k_test: src/q6_k_ppc_mma.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -DQ6K_TEST $< -o $@
+
+$(BUILD)/q2_k_test: src/q2_k_ppc_mma.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -DQ2K_TEST $< -o $@
 
 $(BUILD)/qbit_v4_bench: src/qbit_ppc_mma_v4.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) -DQBIT4_BENCH $< -o $@

@@ -141,10 +141,26 @@ dmin·m_sub, unsigned nibbles) maps onto the identical architecture:
 
 The nibble unpack (and 0xF / shift 4) is cheaper than the 1/2-bit
 unpacks. Verified against an exact double reference across the same
-shape matrix (max normalized error ~2e-6). Q5_K and Q6_K follow the
-same recipe (q ∈ 0..31 / 0..63, still unsigned, still int8-safe against
-int8 activations in the rank-4 GER); Q2_K adds per-sub mins the same
-way. These are the natural next kernels.
+shape matrix (max normalized error ~2e-6). The full standard family is now implemented on the same recipe:
+Q5_K adds the 5th bit from `qh` to the Q4_K nibble unpack; Q6_K and
+Q2_K have per-16 scales and use a 16-deep chunk variant (4 depth steps
+per accumulator round — the same reason the AVX/NEON paths work per
+16). Q6_K's offset form (t = q − 32, same d·sc factor on both terms)
+lets its correction fold into the main FMA as a `vec_msub`; Q2_K keeps
+the two-term mins fixup. All are verified against exact double
+references built directly from the ggml dequantization semantics.
+
+**Register-pressure note (K-quants).** Static analysis of the K-quant
+hot loops shows ~50–85 stack vector ops per chunk iteration, versus
+~0–8 for v3. This is structural, not a codegen accident: the fixup
+keeps fin (32 vectors) live while 8 accumulators alias VSRs 0–31, and
+per-chunk scale vectors push past the 64-register file. The kernels
+stage all accumulator disassembly to a stack buffer before the fixup,
+converting scattered spills into a predictable store/load stream. The
+untested alternative is an 8×8 tile for the per-16 formats (fits the
+register file entirely, at half the independent GER chains) — a
+tradeoff only hardware can settle; both variants are worth
+benchmarking on silicon.
 
 ## Known limitations / future work
 

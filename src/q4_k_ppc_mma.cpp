@@ -269,14 +269,19 @@ static void kernel4k_16x8(const a4k_t * PA, const b4k_t * PB,
                 __builtin_mma_xvi8ger4pp(&acc[1][2], y1, w2);
                 __builtin_mma_xvi8ger4pp(&acc[1][3], y1, w3);
             }
+            // Stage all accumulators to the stack first (frees VSRs 0-31
+            // for the fixup; see DESIGN.md register-pressure note).
+            vsi pr[2][4][4];
+            for (int i = 0; i < 2; i++)
+                for (int g = 0; g < 4; g++)
+                    __builtin_mma_disassemble_acc(pr[i][g], &acc[i][g]);
             // fin += P * (dB_j * dsc_g)  ;  then fin -= TS_j * dm_g
             const vfl dB0 = PB->dB[b][0], dB1 = PB->dB[b][1];
             for (int i = 0; i < 2; i++) {
                 const vfl dB = i ? dB1 : dB0;
                 const vfl TS = PB->TS[ch][i];
                 for (int g = 0; g < 4; g++) {
-                    vsi rowsP[4];
-                    __builtin_mma_disassemble_acc(rowsP, &acc[i][g]);
+                    const vsi * rowsP = pr[i][g];
                     const vfl dsc = PA->dsc[ch][g];
                     const vfl dm  = PA->dm [ch][g];
                     const vfl s0 = vec_mul(vec_splat(dB, 0), dsc);
