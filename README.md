@@ -23,6 +23,8 @@ dominate compute. These kernels close that gap.
 | `src/q5_k_ppc_mma.cpp` | `Q5_K` × `Q8_K`: Q4_K structure + 5th bit from `qh` |
 | `src/q6_k_ppc_mma.cpp` | `Q6_K` × `Q8_K`: 16-deep chunks (per-16 scales); offset correction folds into the main FMA |
 | `src/q2_k_ppc_mma.cpp` | `Q2_K` × `Q8_K`: 16-deep chunks, per-16 scale+min pairs |
+| `src/q3_k_ppc_mma.cpp` | `Q3_K` × `Q8_K`: 16-deep chunks; q′ = code∣(hbit≪2), offset correction folded (TS = 4·dB·bsums) |
+| `src/iq4_ppc_mma.cpp` | `IQ4_NL` × `Q8_0` and `IQ4_XS` × `Q8_K`: signed 16-entry codebook via one `vec_perm`, v2-orientation with pre-folded −128·W correction, 8×8/4-acc |
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the derivation and the
 microarchitectural rationale, [docs/INTEGRATION.md](docs/INTEGRATION.md)

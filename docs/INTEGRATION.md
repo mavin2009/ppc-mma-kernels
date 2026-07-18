@@ -3,10 +3,12 @@
 These kernels use llamafile-sgemm conventions on purpose so the wiring
 is mechanical. Ready-made patches implementing this live in `patches/`:
 `0001-power-mma-q1-q2-sgemm.patch` (Q1_0/Q2_0) and
-`0002-power-mma-kquants-sgemm.patch` (Q4_K/Q5_K/Q6_K/Q2_K x Q8_K,
+`0002-power-mma-kquants-sgemm.patch` (Q4_K/Q5_K/Q6_K/Q2_K x Q8_K),
+`0003-power-mma-q3k-iq4-sgemm.patch` (Q3_K x Q8_K, IQ4_NL x Q8_0,
+IQ4_XS x Q8_K,
 with a one-shot driver that packs the calling thread's row tiles per
 call -- correct but not the final performance shape; the load-time
-repack.cpp integration is the follow-up). Both are applied
+repack.cpp integration is the follow-up). All are applied
 automatically by `scripts/build-bonsai-power.sh`. **Verification status**: the fork with BOTH
 patches applied cross-compiles cleanly for ppc64le (all five kernel
 TUs confirmed in the ggml-cpu objects) and the resulting `llama-cli`

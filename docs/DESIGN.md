@@ -150,6 +150,25 @@ lets its correction fold into the main FMA as a `vec_msub`; Q2_K keeps
 the two-term mins fixup. All are verified against exact double
 references built directly from the ggml dequantization semantics.
 
+**Q3_K** completes the standard family: q′ = code | (hbit << 2) ∈ 0..7
+with t = q′ − 4 shares the d·(sc−32) factor on both terms, so it takes
+the Q6_K folded-correction form with TS = 4·dB·bsums; the 6-bit scale
+packing is decoded once at repack with ggml's aux-mask trick.
+
+**IQ4_NL / IQ4_XS: the codebook technique.** These formats map nibbles
+through a signed 16-entry int8 codebook. The lookup is a single
+`vec_perm` per 16 codes — but signed weight values cannot ride the
+unsigned GER operand, so the operand orientation flips back to the
+v1/v2 scheme: codebook values on the signed operand, activations
+XOR-0x80 flipped, and the bias correction uses per-(row, chunk)
+codebook-value sums W computed at repack, pre-folded as 128·W·scale so
+the fixup is one `vec_msub` + one `vec_madd`. These kernels use an 8×8
+tile on 4 accumulators (fully register-resident — one side of the
+tradeoff flagged below, and the natural fit for the flipped
+orientation's write-back). The same technique extends to the wider IQ
+family (IQ2/IQ3 grids are larger codebooks with sign masks); those
+remain future work.
+
 **Register-pressure note (K-quants).** Static analysis of the K-quant
 hot loops shows ~50–85 stack vector ops per chunk iteration, versus
 ~0–8 for v3. This is structural, not a codegen accident: the fixup
