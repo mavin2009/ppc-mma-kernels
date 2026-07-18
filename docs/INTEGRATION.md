@@ -12,7 +12,10 @@ IQ3_XXS, IQ3_S, IQ1_S x Q8_K),
 `0006-power-mma-robustness.patch` (GGML_ABORT on pack-alloc failure,
 well-defined unaligned loads, C11-conformant aligned_alloc sizes),
 `0007-power-mma-mxfp4-per16-packcache.patch` (MXFP4/IQ2_XS/IQ2_S/IQ1_M
-dispatch + tensor-keyed weight-pack cache: pack once per tensor,
+dispatch + tensor-keyed weight-pack cache: pack once per tensor),
+`0008-power-mma-nvfp4-qbit-v4.patch` (NVFP4 dispatch; qbit Q1_0/Q2_0
+driver upgraded to the v4 packed API with cache + no-packing GEMV for
+n == 1,
 with a one-shot driver that packs the calling thread's row tiles per
 call -- correct but not the final performance shape; the load-time
 repack.cpp integration is the follow-up). All are applied

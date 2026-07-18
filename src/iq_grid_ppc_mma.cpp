@@ -47,6 +47,11 @@ typedef struct { ggml_half d; uint16_t qs[QK_K/8]; uint8_t scales[QK_K/32]; } bl
 typedef struct { ggml_half d; uint8_t qs[QK_K/4]; uint8_t qh[QK_K/32]; uint8_t scales[QK_K/32]; } block_iq2_s;
 typedef struct { uint8_t qs[QK_K/8]; uint8_t qh[QK_K/16]; uint8_t scales[QK_K/32]; } block_iq1_m;
 typedef struct { float d; int8_t qs[QK_K]; int16_t bsums[QK_K/16]; } block_q8_K;
+#define QK_NVFP4 64
+#define QK_NVFP4_SUB 16
+typedef struct { uint8_t d[QK_NVFP4/QK_NVFP4_SUB]; uint8_t qs[QK_NVFP4/2]; } block_nvfp4;
+#define QK8_0 32
+typedef struct { ggml_half d; int8_t qs[QK8_0]; } block_q8_0;
 
 static_assert(sizeof(block_tq1_0)   == 2 + 4 + 48, "bad tq1_0");
 static_assert(sizeof(block_tq2_0)   == 2 + 64, "bad tq2_0");
@@ -57,6 +62,7 @@ static_assert(sizeof(block_iq1_s)   == 2 + QK_K/8 + QK_K/16, "bad iq1_s");
 static_assert(sizeof(block_iq2_xs)  == 2 + QK_K/4 + QK_K/32, "bad iq2_xs");
 static_assert(sizeof(block_iq2_s)   == 2 + QK_K/4 + QK_K/32 + QK_K/32, "bad iq2_s");
 static_assert(sizeof(block_iq1_m)   == QK_K/8 + QK_K/16 + QK_K/32, "bad iq1_m");
+static_assert(sizeof(block_nvfp4)   == 4 + QK_NVFP4/2, "bad nvfp4");
 
 static inline float fp16_to_fp32(ggml_half h) {
     const uint32_t sign = (uint32_t)(h >> 15) << 31;
@@ -195,6 +201,33 @@ static void dec_iq1_s(const block_iq1_s * b, int8_t code[QK_K], float sc[8]) {
     }
 }
 
+
+// NVFP4 (64-element blocks, four 16-element sub-blocks with UE4M3
+// scales, MXFP4's pre-doubled e2m1 codebook -- the *0.5 inside the
+// UE4M3 conversion compensates the doubling, matching ggml's dequant).
+static const int8_t nvfp4_kvalues[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+};
+#include <cmath>
+static inline float ue4m3_to_fp32(uint8_t x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const int exp = (x >> 3) & 0xF;
+    const int man = x & 0x7;
+    float raw = (exp == 0) ? ldexpf((float)man, -9)
+                           : ldexpf(1.0f + (float)man / 8.0f, exp - 7);
+    return raw * 0.5f;
+}
+
+// one 64-block -> 64 signed codes + 4 per-16 scales
+static void dec_nvfp4(const block_nvfp4 * b, int8_t code[QK_NVFP4], float sc[4]) {
+    for (int s = 0; s < 4; s++) {
+        sc[s] = ue4m3_to_fp32(b->d[s]);
+        for (int j = 0; j < 8; j++) {
+            code[16*s + j + 0] = nvfp4_kvalues[b->qs[8*s + j] & 0xF];
+            code[16*s + j + 8] = nvfp4_kvalues[b->qs[8*s + j] >>  4];
+        }
+    }
+}
 
 // ---- per-16-scale decoders (codes + 16 scales per superblock) ----
 
@@ -556,6 +589,68 @@ extern "C" void grid16_repack_iq2_s(const block_iq2_s * A, int64_t lda, int64_t 
 extern "C" void grid16_repack_iq1_m(const block_iq1_m * A, int64_t lda, int64_t m, int64_t k, void * p) {
     repack_grid16<block_iq1_m, dec16_iq1_m>(A, lda, m, k, (agrid16_t *)p); }
 
+extern "C" void grid16_repack_nvfp4(const block_nvfp4 * A, int64_t lda,
+                                    int64_t m, int64_t k, void * p) {
+    agrid16_t * P = (agrid16_t *)p;
+    const int64_t nb = k/QK_NVFP4, ns = sl(k);
+    for (int64_t it = 0; it < rt(m); it++)
+    for (int64_t s = 0; s < ns; s++) {
+        agrid16_t * T = &P[it*ns + s];
+        const int64_t b0 = (s*KC_CH16)/4;               // 64-blocks per slab start
+        const int64_t nbl = (nb - b0) < KC_CH16/4 ? (nb - b0) : KC_CH16/4;
+        for (int64_t b = 0; b < nbl; b++) {
+            int8_t code[MR][QK_NVFP4]; float sc[MR][4];
+            for (int r = 0; r < MR; r++) {
+                int64_t rr = it*MR + r; if (rr >= m) rr = m - 1;
+                dec_nvfp4(&A[rr*lda + b0 + b], code[r], sc[r]);
+            }
+            for (int c = 0; c < 4; c++) {
+                vsc w[MR]; float scale[MR];
+                for (int r = 0; r < MR; r++) {
+                    memcpy(&w[r], code[r] + 16*c, 16);
+                    scale[r] = sc[r][c];
+                }
+                grid16_place_chunk(T, 4*b + c, w, scale);
+            }
+        }
+    }
+}
+
+// q8_0 activations for the 16-deep framework: each 32-block feeds two
+// chunks; its dB is replicated to both.
+extern "C" void grid16_pack_b_q8_0(const block_q8_0 * B, int64_t ldb,
+                                   int64_t n, int64_t k, void * packed) {
+    bgrid16_t * P = (bgrid16_t *)packed;
+    const int64_t kb = k/32, ns = sl(k);
+    const vuc flip = vec_splats((unsigned char)0x80);
+    for (int64_t jt = 0; jt < ct(n); jt++)
+    for (int64_t s = 0; s < ns; s++) {
+        bgrid16_t * T = &P[jt*ns + s];
+        const int64_t b0 = (s*KC_CH16)/2;
+        const int64_t nbl = (kb - b0) < KC_CH16/2 ? (kb - b0) : KC_CH16/2;
+        for (int64_t b = 0; b < nbl; b++) {
+            const block_q8_0 * yb[NR]; float dB[NR];
+            for (int j = 0; j < NR; j++) {
+                int64_t jj = jt*NR + j; if (jj >= n) jj = n - 1;
+                yb[j] = &B[jj*ldb + b0 + b];
+                dB[j] = fp16_to_fp32(yb[j]->d);
+            }
+            for (int h = 0; h < 2; h++) {
+                const int64_t ch = 2*b + h;
+                T->dB[ch][0] = (vfl){ dB[0], dB[1], dB[2], dB[3] };
+                T->dB[ch][1] = (vfl){ dB[4], dB[5], dB[6], dB[7] };
+                vui rows4[4];
+                for (int a = 0; a < 2; a++) {
+                    for (int j = 0; j < 4; j++)
+                        rows4[j] = (vui)vec_xor(
+                            load16u((const uint8_t *)(yb[4*a + j]->qs) + 16*h), flip);
+                    mma_transpose4(rows4, &T->v[ch][a], 2);
+                }
+            }
+        }
+    }
+}
+
 extern "C" void grid16_pack_b_q8_K(const block_q8_K * B, int64_t ldb,
                                    int64_t n, int64_t k, void * packed) {
     bgrid16_t * P = (bgrid16_t *)packed;
@@ -862,6 +957,60 @@ static void fill_i1m(block_iq1_m * b) {
     }
 }
 
+static int run_nvfp4(void) {
+    struct { int64_t m, n, k; } cases[] = {
+        { 8, 8, 256 }, { 16, 16, 512 }, { 13, 7, 704 },
+        { 40, 24, 4096 }, { 32, 1, 2048 }, { 9, 3, 4288 },
+    };
+    int fails = 0;
+    for (auto & tc : cases) {
+        const int64_t m = tc.m, n = tc.n, k = tc.k;
+        const int64_t lda = k/QK_NVFP4, ldb = k/32, ldc = m;
+        block_nvfp4 * A = (block_nvfp4*)aligned_alloc(64, ((m*lda*sizeof(block_nvfp4))+63)&~63ul);
+        block_q8_0 * B = (block_q8_0*)aligned_alloc(64, ((n*ldb*sizeof(block_q8_0))+63)&~63ul);
+        float * C = (float*)aligned_alloc(64, ((m*n*sizeof(float))+63)&~63ul);
+        for (int64_t i = 0; i < m*lda; i++) {
+            for (int s = 0; s < 4; s++) A[i].d[s] = (uint8_t)(20 + xr()%80);
+            for (int b = 0; b < QK_NVFP4/2; b++) A[i].qs[b] = (uint8_t)(xr() & 0xff);
+        }
+        for (int64_t i = 0; i < n*ldb; i++) {
+            B[i].d = f32_to_f16_approx(0.001f + (xr()%1000)/500000.0f);
+            for (int b = 0; b < 32; b++) B[i].qs[b] = (int8_t)((int)(xr()%255) - 127);
+        }
+        void * PA = aligned_alloc(64, grid16_apack_size(m, k));
+        void * PB = aligned_alloc(64, grid16_bpack_size(n, k));
+        grid16_repack_nvfp4(A, lda, m, k, PA);
+        grid16_pack_b_q8_0(B, ldb, n, k, PB);
+        grid16_gemm_packed(m, n, k, PA, PB, C, ldc, 0, 2);
+        grid16_gemm_packed(m, n, k, PA, PB, C, ldc, 1, 2);
+        double emax = 0, scale = 0;
+        int8_t code[QK_NVFP4]; float sc[4];
+        for (int64_t i = 0; i < m; i++)
+            for (int64_t j = 0; j < n; j++) {
+                double ref = 0;
+                for (int64_t b = 0; b < k/QK_NVFP4; b++) {
+                    dec_nvfp4(&A[i*lda + b], code, sc);
+                    for (int s = 0; s < 4; s++) {
+                        long P = 0;
+                        const int8_t * yq = B[j*ldb + (b*2 + s/2)].qs + 16*(s%2);
+                        for (int l = 0; l < 16; l++) P += (long)code[16*s + l] * yq[l];
+                        ref += (double)sc[s] * (double)fp16_to_fp32(B[j*ldb + (b*2 + s/2)].d) * (double)P;
+                    }
+                }
+                scale += fabs(ref);
+                double e = fabs((double)C[i + j*ldc] - ref);
+                if (e > emax) emax = e;
+            }
+        scale = scale/(m*n) + 1e-30; emax /= scale;
+        bool ok = emax < 1e-5;
+        printf("nvfp4    m=%3lld n=%3lld k=%5lld  err=%.3g  %s\n",
+               (long long)m,(long long)n,(long long)k, emax, ok?"OK":"FAIL");
+        if (!ok) fails++;
+        free(A); free(B); free(C); free(PA); free(PB);
+    }
+    return fails;
+}
+
 int main() {
     int fails = 0;
     fails += run<block_tq2_0,   dec_tq2_0,   grid_repack_tq2_0,   fill_tq2>("tq2_0");
@@ -873,6 +1022,7 @@ int main() {
     fails += run16<block_iq2_xs, dec16_iq2_xs, grid16_repack_iq2_xs, fill_i2xs>("iq2_xs");
     fails += run16<block_iq2_s,  dec16_iq2_s,  grid16_repack_iq2_s,  fill_i2s>("iq2_s");
     fails += run16<block_iq1_m,  dec16_iq1_m,  grid16_repack_iq1_m,  fill_i1m>("iq1_m");
+    fails += run_nvfp4();
     printf(fails ? "SOME TESTS FAILED\n" : "ALL TESTS PASSED\n");
     return fails ? 1 : 0;
 }

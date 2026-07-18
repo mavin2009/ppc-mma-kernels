@@ -25,7 +25,7 @@ fi
 cd llama.cpp
 git fetch origin "$FORK_COMMIT" 2>/dev/null || true
 git checkout "$FORK_COMMIT" 2>/dev/null || echo "warning: building fork tip instead of pinned commit"
-for P in 0001-power-mma-q1-q2-sgemm 0002-power-mma-kquants-sgemm 0003-power-mma-q3k-iq4-sgemm 0004-power-mma-legacy-sgemm 0005-power-mma-grids-ternary-sgemm 0006-power-mma-robustness 0007-power-mma-mxfp4-per16-packcache; do
+for P in 0001-power-mma-q1-q2-sgemm 0002-power-mma-kquants-sgemm 0003-power-mma-q3k-iq4-sgemm 0004-power-mma-legacy-sgemm 0005-power-mma-grids-ternary-sgemm 0006-power-mma-robustness 0007-power-mma-mxfp4-per16-packcache 0008-power-mma-nvfp4-qbit-v4; do
     git apply --check "$REPO_DIR/patches/$P.patch"
     git apply "$REPO_DIR/patches/$P.patch"
 done

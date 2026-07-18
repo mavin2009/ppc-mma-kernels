@@ -9,14 +9,14 @@ and what has not.
 | Property | Method | Status |
 |---|---|---|
 | MMA instruction semantics (`xvi8ger4pp` operand signedness/layout) | Empirical probes under `qemu -cpu power10` | Verified |
-| Numerical correctness, all 25 formats | Exact float64 references, random data, ragged/multi-slab/n=1 shapes; 13 self-checking suites, `make test` | Verified (max normalized err ~4e-6, matching float-reference rounding) |
+| Numerical correctness, all 26 formats | Exact float64 references, random data, ragged/multi-slab/n=1 shapes; 13 self-checking suites, `make test` | Verified (max normalized err ~4e-6, matching float-reference rounding) |
 | Warnings hygiene | `-Wall -Wextra -Werror`, GCC 14 | Clean |
 | Undefined behavior | `-fsanitize=undefined -fno-sanitize-recover=all` under qemu (v4, q4_K, iq_grid, legacy suites) | Clean (one alignment-model finding fixed repo-wide via `load16u`) |
 | `aligned_alloc` C11 conformance | Pack-size functions round to alignment | Fixed |
 | Allocation-failure behavior (in-tree drivers) | `GGML_ABORT` instead of silent skip | Fixed (patch 0006) |
 | Out-of-bounds loads at block-array tails | Manual audit of every `vec_xl`/`load16u` against struct extents; one real OOB found and fixed in v1 kernels early on | Audited |
 | Integer overflow in GER accumulation | Bounds analysis: max chunk dot ≪ 2^31 for every format | Verified by analysis |
-| Fork integration compiles + links (patches 0001–0006) | ppc64le cross-build, GCC 14, all 9 kernel TUs in ggml-cpu; `llama-cli` executes under qemu | Verified |
+| Fork integration compiles + links (patches 0001–0008) | ppc64le cross-build, GCC 14, all 9 kernel TUs in ggml-cpu; `llama-cli` executes under qemu | Verified |
 | End-to-end inference numerics through patched dispatch | Requires model weights + hardware | **NOT verified** — DEPLOY.md step 5 is mandatory before production |
 | Grid/ternary decoders vs ggml's dequantization | Test refs share the decoders (consistency only); decoders are line-by-line ports | **NOT independently verified** — covered by the same step 5 |
 | Performance on silicon | qemu is an instruction-count proxy only | **NOT verified** — all perf claims are static analysis |

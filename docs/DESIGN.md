@@ -190,7 +190,10 @@ DEPLOY.md is the decoder's independent verification). A 16-deep signed-chunk
 variant (4 GER steps per accumulator round) now covers the per-16-scale
 stragglers IQ2_XS, IQ2_S, and IQ1_M — the last of these reassembling
 its fp16 super-scale from scale-nibble high bits, with per-8 deltas
-folded into exact integer codes like IQ1_S. MXFP4 (gpt-oss) rides the
+folded into exact integer codes like IQ1_S. NVFP4 completes the fp4 pair on the
+16-deep framework (64-element blocks, four UE4M3-scaled sub-blocks;
+the ×0.5 inside the UE4M3 conversion compensates the pre-doubled
+codebook). MXFP4 (gpt-oss) rides the
 IQ4 codebook kernel: its e2m1 values are exact integers once doubled
 ({0,1,2,3,4,6,8,12}±), with the E8M0 half-scale supplying the ÷2.
 
