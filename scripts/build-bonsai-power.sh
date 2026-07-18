@@ -10,7 +10,7 @@
 #
 # The patch was generated against fork commit
 # 79697f23a2c8f3aa2ccb2fd7406095a8dbfbb454 (branch `prism`); if the fork
-# has moved and the patch no longer applies cleanly, pin that commit or
+# has moved and a patch no longer applies cleanly, pin that commit or
 # rebase the patch (it touches 2 files and adds 2).
 set -e
 
@@ -25,8 +25,10 @@ fi
 cd llama.cpp
 git fetch origin "$FORK_COMMIT" 2>/dev/null || true
 git checkout "$FORK_COMMIT" 2>/dev/null || echo "warning: building fork tip instead of pinned commit"
-git apply --check "$REPO_DIR/patches/0001-power-mma-q1-q2-sgemm.patch"
-git apply "$REPO_DIR/patches/0001-power-mma-q1-q2-sgemm.patch"
+for P in 0001-power-mma-q1-q2-sgemm 0002-power-mma-kquants-sgemm; do
+    git apply --check "$REPO_DIR/patches/$P.patch"
+    git apply "$REPO_DIR/patches/$P.patch"
+done
 
 if [ -n "$CROSS" ]; then
     cat > /tmp/ppc64le-toolchain.cmake << 'TC'

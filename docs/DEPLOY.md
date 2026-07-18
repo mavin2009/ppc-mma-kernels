@@ -20,10 +20,9 @@ cd ppc-mma-kernels
 ```
 
 The script clones the PrismML llama.cpp fork at the pinned commit the
-patch was verified against (`79697f2…`), applies
-`patches/0001-power-mma-q1-q2-sgemm.patch` (adds the v3 kernels as
-`ggml/src/ggml-cpu/llamafile/qbit_ppc_mma.{cpp,h}` and two dispatch
-cases in `llamafile_sgemm`), and builds `llama-cli`, `llama-server`,
+patch was verified against (`79697f2…`), applies both integration
+patches (Q1_0/Q2_0 v3 kernels plus the Q4_K/Q5_K/Q6_K/Q2_K family --
+so standard K-quant GGUF models also hit the MMA path), and builds `llama-cli`, `llama-server`,
 and `llama-bench` natively with `-mcpu=native`.
 
 Verification status of this integration: the patched fork

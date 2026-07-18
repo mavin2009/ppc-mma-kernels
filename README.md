@@ -35,9 +35,9 @@ end-to-end path to running Bonsai on a Power machine.
 ./scripts/build-bonsai-power.sh
 ```
 
-clones the PrismML fork at a pinned commit, applies
-`patches/0001-power-mma-q1-q2-sgemm.patch` (verified: the patched fork
-cross-compiles for ppc64le and `llama-cli` runs under qemu-power10),
+clones the PrismML fork at a pinned commit, applies both integration patches -- Q1_0/Q2_0 and the full K-quant
+family (verified: the patched fork cross-compiles for ppc64le with all
+five kernel TUs and `llama-cli` runs under qemu-power10) --
 and builds `llama-cli` / `llama-server` / `llama-bench`. Details and
 model download in [docs/DEPLOY.md](docs/DEPLOY.md).
 
