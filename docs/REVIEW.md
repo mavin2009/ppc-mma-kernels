@@ -32,6 +32,13 @@ and what has not.
 - Pack cache (patch 0007) assumes weight-tensor immutability and
   pointer-identity keying — sound for llama.cpp inference, stated in
   the source; training or reload-at-same-address needs invalidation.
+- A Makefile defect found during build-chain review: an editing error
+  had pointed the iq_grid test target at the legacy source, so `make
+  test` ran the legacy suite twice and the grid suite not at all (the
+  grid suite had only ever run via direct compiler invocations, where
+  it passed, including under UBSan). Fixed; `make test` now runs all
+  13 real suites. Lesson encoded: test targets now list their true
+  source dependencies individually.
 - Git history contains two recovery commits from process mistakes
   (documented in their messages); code state is what the test matrix
   verifies.
@@ -39,7 +46,7 @@ and what has not.
 ## Suggested review order
 
 1. `docs/DESIGN.md` — the algebra and the microarchitectural argument.
-2. `src/qbit_ppc_mma_v3.cpp` — the core formulation, smallest complete kernel.
+2. `src/reference/qbit_ppc_mma_v3.cpp` — the core formulation, smallest complete kernel.
 3. `src/qbit_ppc_mma_v4.cpp` — the production API shape.
 4. One K-quant (`q4_k`) and one signed-codebook kernel (`iq4`) for the
    two operand orientations.

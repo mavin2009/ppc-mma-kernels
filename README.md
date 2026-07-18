@@ -14,10 +14,10 @@ dominate compute. These kernels close that gap.
 
 | File | What it is |
 |---|---|
-| `src/q1_0_ppc_mma.cpp` | v1: 4x4 tile, single accumulator, `Q1_0` × `Q8_0` |
-| `src/q2_0_ppc_mma.cpp` | v1: same structure for ternary `Q2_0` × `Q8_0` |
-| `src/q1_0_ppc_mma_v2.cpp` | v2: hoisted packing, K-slab blocking, 8x8 tile on 4 accumulators |
-| `src/qbit_ppc_mma_v3.cpp` | v3: unified `Q1_0`+`Q2_0`, unsigned-code formulation with separable correction, 16x8 tile on all 8 accumulators |
+| `src/reference/q1_0_ppc_mma.cpp` | (reference) v1: 4x4 tile, single accumulator, `Q1_0` × `Q8_0` |
+| `src/reference/q2_0_ppc_mma.cpp` | (reference) v1: same structure for ternary `Q2_0` × `Q8_0` |
+| `src/reference/q1_0_ppc_mma_v2.cpp` | (reference) v2: hoisted packing, K-slab blocking, 8x8 tile on 4 accumulators |
+| `src/reference/qbit_ppc_mma_v3.cpp` | (reference) v3: unified `Q1_0`+`Q2_0`, unsigned-code formulation with separable correction, 16x8 tile on all 8 accumulators |
 | `src/qbit_ppc_mma_v4.cpp` | v4: production API — one-time weight repack, shared activation pack, raw-weight GEMV path for token generation |
 | `src/q4_k_ppc_mma.cpp` | `Q4_K` × `Q8_K` (first K-quant kernel): unsigned nibbles + separable mins correction via `bsums`, same 16x8/8-acc architecture |
 | `src/q5_k_ppc_mma.cpp` | `Q5_K` × `Q8_K`: Q4_K structure + 5th bit from `qh` |
