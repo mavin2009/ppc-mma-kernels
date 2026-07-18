@@ -186,9 +186,24 @@ made exact with codes = 8·g ± 1 and scale = dl/8. The decoders are
 direct scalar ports of ggml's dequantize_row semantics; note the test
 references run *through the same decoders* (they verify GEMM/pack
 consistency, not decoder-vs-ggml — the temperature-0 check in
-DEPLOY.md is the decoder's independent verification). Still deferred:
-IQ2_XS, IQ2_S, IQ1_M, whose per-16 scales need a 16-deep signed-chunk
-kernel variant.
+DEPLOY.md is the decoder's independent verification). A 16-deep signed-chunk
+variant (4 GER steps per accumulator round) now covers the per-16-scale
+stragglers IQ2_XS, IQ2_S, and IQ1_M — the last of these reassembling
+its fp16 super-scale from scale-nibble high bits, with per-8 deltas
+folded into exact integer codes like IQ1_S. MXFP4 (gpt-oss) rides the
+IQ4 codebook kernel: its e2m1 values are exact integers once doubled
+({0,1,2,3,4,6,8,12}±), with the E8M0 half-scale supplying the ÷2.
+
+**Tensor-keyed pack cache (patch 0007).** Repacking is deterministic
+and depends only on immutable weights, so it belongs at model load.
+`ppc_pack_cache.cpp` delivers that behavior at the dispatch layer: the
+first call for a tensor packs the whole matrix once (a mutex+condvar
+publish protocol lets other threads wait rather than duplicate work);
+every later call reuses it. Keyed on (data pointer, m, k, variant);
+capacity-bounded (PPC_MMA_PACK_CACHE_MB, default 2048, 0 disables);
+on any miss-with-full-cache or allocation failure callers fall back to
+the per-call path — never wrong, only slower. The immutability
+assumption and its limits are stated in the source header for review.
 
 **Register-pressure note (K-quants).** Static analysis of the K-quant
 hot loops shows ~50–85 stack vector ops per chunk iteration, versus

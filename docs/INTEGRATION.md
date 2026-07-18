@@ -10,7 +10,9 @@ IQ4_XS x Q8_K),
 `0005-power-mma-grids-ternary-sgemm.patch` (TQ1_0/TQ2_0, IQ2_XXS,
 IQ3_XXS, IQ3_S, IQ1_S x Q8_K),
 `0006-power-mma-robustness.patch` (GGML_ABORT on pack-alloc failure,
-well-defined unaligned loads, C11-conformant aligned_alloc sizes,
+well-defined unaligned loads, C11-conformant aligned_alloc sizes),
+`0007-power-mma-mxfp4-per16-packcache.patch` (MXFP4/IQ2_XS/IQ2_S/IQ1_M
+dispatch + tensor-keyed weight-pack cache: pack once per tensor,
 with a one-shot driver that packs the calling thread's row tiles per
 call -- correct but not the final performance shape; the load-time
 repack.cpp integration is the follow-up). All are applied

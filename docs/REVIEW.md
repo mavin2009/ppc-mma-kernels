@@ -9,7 +9,7 @@ and what has not.
 | Property | Method | Status |
 |---|---|---|
 | MMA instruction semantics (`xvi8ger4pp` operand signedness/layout) | Empirical probes under `qemu -cpu power10` | Verified |
-| Numerical correctness, all 21 formats | Exact float64 references, random data, ragged/multi-slab/n=1 shapes; 13 self-checking suites, `make test` | Verified (max normalized err ~4e-6, matching float-reference rounding) |
+| Numerical correctness, all 25 formats | Exact float64 references, random data, ragged/multi-slab/n=1 shapes; 13 self-checking suites, `make test` | Verified (max normalized err ~4e-6, matching float-reference rounding) |
 | Warnings hygiene | `-Wall -Wextra -Werror`, GCC 14 | Clean |
 | Undefined behavior | `-fsanitize=undefined -fno-sanitize-recover=all` under qemu (v4, q4_K, iq_grid, legacy suites) | Clean (one alignment-model finding fixed repo-wide via `load16u`) |
 | `aligned_alloc` C11 conformance | Pack-size functions round to alignment | Fixed |
@@ -29,8 +29,9 @@ and what has not.
 - 16×8/8-acc vs 8×8/4-acc tile choice for per-16-scale formats is a
   register-pressure vs chain-parallelism tradeoff only hardware can
   settle (DESIGN.md).
-- IQ2_XS, IQ2_S, IQ1_M unimplemented (per-16 scales need a 16-deep
-  signed-chunk variant).
+- Pack cache (patch 0007) assumes weight-tensor immutability and
+  pointer-identity keying — sound for llama.cpp inference, stated in
+  the source; training or reload-at-same-address needs invalidation.
 - Git history contains two recovery commits from process mistakes
   (documented in their messages); code state is what the test matrix
   verifies.

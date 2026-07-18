@@ -43,6 +43,9 @@ typedef struct { ggml_half d; uint8_t qs[3*QK_K/8]; } block_iq3_xxs;
 typedef struct { ggml_half d; uint8_t qs[QK_K/4]; uint8_t qh[QK_K/32];
                  uint8_t signs[QK_K/8]; uint8_t scales[QK_K/64]; } block_iq3_s;
 typedef struct { ggml_half d; uint8_t qs[QK_K/8]; uint16_t qh[QK_K/32]; } block_iq1_s;
+typedef struct { ggml_half d; uint16_t qs[QK_K/8]; uint8_t scales[QK_K/32]; } block_iq2_xs;
+typedef struct { ggml_half d; uint8_t qs[QK_K/4]; uint8_t qh[QK_K/32]; uint8_t scales[QK_K/32]; } block_iq2_s;
+typedef struct { uint8_t qs[QK_K/8]; uint8_t qh[QK_K/16]; uint8_t scales[QK_K/32]; } block_iq1_m;
 typedef struct { float d; int8_t qs[QK_K]; int16_t bsums[QK_K/16]; } block_q8_K;
 
 static_assert(sizeof(block_tq1_0)   == 2 + 4 + 48, "bad tq1_0");
@@ -51,6 +54,9 @@ static_assert(sizeof(block_iq2_xxs) == 2 + QK_K/4, "bad iq2_xxs");
 static_assert(sizeof(block_iq3_xxs) == 2 + 3*QK_K/8, "bad iq3_xxs");
 static_assert(sizeof(block_iq3_s)   == 2 + 13*(QK_K/32) + QK_K/64, "bad iq3_s");
 static_assert(sizeof(block_iq1_s)   == 2 + QK_K/8 + QK_K/16, "bad iq1_s");
+static_assert(sizeof(block_iq2_xs)  == 2 + QK_K/4 + QK_K/32, "bad iq2_xs");
+static_assert(sizeof(block_iq2_s)   == 2 + QK_K/4 + QK_K/32 + QK_K/32, "bad iq2_s");
+static_assert(sizeof(block_iq1_m)   == QK_K/8 + QK_K/16 + QK_K/32, "bad iq1_m");
 
 static inline float fp16_to_fp32(ggml_half h) {
     const uint32_t sign = (uint32_t)(h >> 15) << 31;
@@ -186,6 +192,77 @@ static void dec_iq1_s(const block_iq1_s * b, int8_t code[QK_K], float sc[8]) {
                 y[8*l + j] = (int8_t)(8*grid[j] + dsign);
         }
         qs += 4;
+    }
+}
+
+
+// ---- per-16-scale decoders (codes + 16 scales per superblock) ----
+
+static void dec16_iq2_xs(const block_iq2_xs * b, int8_t code[QK_K], float sc[16]) {
+    const float d = fp16_to_fp32(b->d);
+    for (int ib32 = 0; ib32 < 8; ++ib32) {
+        sc[2*ib32 + 0] = d * (0.5f + (b->scales[ib32] & 0xF)) * 0.25f;
+        sc[2*ib32 + 1] = d * (0.5f + (b->scales[ib32] >>  4)) * 0.25f;
+        int8_t * y = code + 32*ib32;
+        for (int l = 0; l < 4; ++l) {
+            const uint16_t w = b->qs[4*ib32 + l];
+            const uint8_t * grid = (const uint8_t *)(iq2xs_grid + (w & 511));
+            const uint8_t signs = ksigns_iq2xs[w >> 9];
+            for (int j = 0; j < 8; ++j)
+                y[8*l + j] = (int8_t)((signs & kmask_iq2xs[j]) ? -(int)grid[j] : (int)grid[j]);
+        }
+    }
+}
+
+static void dec16_iq2_s(const block_iq2_s * b, int8_t code[QK_K], float sc[16]) {
+    const float d = fp16_to_fp32(b->d);
+    const uint8_t * qs = b->qs;
+    const uint8_t * signs = b->qs + QK_K/8;
+    for (int ib32 = 0; ib32 < 8; ++ib32) {
+        sc[2*ib32 + 0] = d * (0.5f + (b->scales[ib32] & 0xF)) * 0.25f;
+        sc[2*ib32 + 1] = d * (0.5f + (b->scales[ib32] >>  4)) * 0.25f;
+        int8_t * y = code + 32*ib32;
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t * grid = (const uint8_t *)(iq2s_grid +
+                (qs[l] | ((b->qh[ib32] << (8 - 2*l)) & 0x300)));
+            for (int j = 0; j < 8; ++j)
+                y[8*l + j] = (int8_t)((signs[l] & kmask_iq2xs[j]) ? -(int)grid[j] : (int)grid[j]);
+        }
+        qs += 4; signs += 4;
+    }
+}
+
+// IQ1_M: fp16 superscale reassembled from scale-nibble high bits;
+// per-16 3-bit scales, per-8 deltas.  Exact integer form as IQ1_S:
+// codes = 8*grid + sign(delta), scale = dl/8.
+static void dec16_iq1_m(const block_iq1_m * b, int8_t code[QK_K], float sc[16]) {
+    const uint16_t * scw = (const uint16_t *)b->scales;
+    uint16_t du16 = (uint16_t)((scw[0] >> 12) | ((scw[1] >> 8) & 0x00f0) |
+                               ((scw[2] >> 4) & 0x0f00) | (scw[3] & 0xf000));
+    const float d = fp16_to_fp32(du16);
+    const uint8_t * qs = b->qs;
+    const uint8_t * qh = b->qh;
+    for (int ib = 0; ib < 8; ++ib) {
+        const float dl1 = d * (2*((scw[ib/2] >> (6*(ib%2)+0)) & 0x7) + 1);
+        const float dl2 = d * (2*((scw[ib/2] >> (6*(ib%2)+3)) & 0x7) + 1);
+        sc[2*ib + 0] = dl1 * 0.125f;
+        sc[2*ib + 1] = dl2 * 0.125f;
+        uint16_t idx[4]; int dsg[4];
+        idx[0] = (uint16_t)(qs[0] | ((qh[0] << 8) & 0x700));
+        idx[1] = (uint16_t)(qs[1] | ((qh[0] << 4) & 0x700));
+        idx[2] = (uint16_t)(qs[2] | ((qh[1] << 8) & 0x700));
+        idx[3] = (uint16_t)(qs[3] | ((qh[1] << 4) & 0x700));
+        dsg[0] = (qh[0] & 0x08) ? -1 : +1;
+        dsg[1] = (qh[0] & 0x80) ? -1 : +1;
+        dsg[2] = (qh[1] & 0x08) ? -1 : +1;
+        dsg[3] = (qh[1] & 0x80) ? -1 : +1;
+        int8_t * y = code + 32*ib;
+        for (int l = 0; l < 4; ++l) {
+            const int8_t * grid = (const int8_t *)(iq1s_grid + idx[l]);
+            for (int j = 0; j < 8; ++j)
+                y[8*l + j] = (int8_t)(8*grid[j] + dsg[l]);
+        }
+        qs += 4; qh += 2;
     }
 }
 
@@ -405,6 +482,179 @@ extern "C" void grid_gemm_packed(int64_t m, int64_t n, int64_t k,
     }
 }
 
+
+// ---- 16-deep chunk variant for per-16-scale formats ----
+
+#define KC_CH16 (KC_ELEMS / 16)
+
+typedef struct {
+    vuc v[KC_CH16][8];                    // 4 depth-steps x 2 rowgroups
+    vfl sA  [KC_CH16][2];
+    vfl C128[KC_CH16][2];
+} agrid16_t;
+
+typedef struct {
+    vuc v[KC_CH16][8];                    // 4 depth-steps x 2 colgroups
+    vfl dB[KC_CH16][2];
+} bgrid16_t;
+
+extern "C" size_t grid16_apack_size(int64_t m, int64_t k) {
+    return (((size_t)(rt(m) * sl(k)) * sizeof(agrid16_t)) + 63) & ~(size_t)63;
+}
+extern "C" size_t grid16_bpack_size(int64_t n, int64_t k) {
+    return (((size_t)(ct(n) * sl(k)) * sizeof(bgrid16_t)) + 63) & ~(size_t)63;
+}
+
+static void grid16_place_chunk(agrid16_t * T, int64_t ch,
+                               const vsc w[MR], const float scale[MR]) {
+    for (int g = 0; g < 2; g++) {
+        float W[4];
+        vui rows4[4];
+        for (int r = 0; r < 4; r++) rows4[r] = (vui)w[4*g + r];
+        mma_transpose4(rows4, &T->v[ch][g], 2);
+        for (int r = 0; r < 4; r++) {
+            vsi z = vec_splats(0);
+            vsi sm = vec_sum4s(w[4*g + r], z);
+            W[r] = (float)hsum(sm);
+        }
+        T->sA  [ch][g] = (vfl){ scale[4*g], scale[4*g+1], scale[4*g+2], scale[4*g+3] };
+        T->C128[ch][g] = (vfl){ 128.0f*W[0]*scale[4*g],   128.0f*W[1]*scale[4*g+1],
+                                128.0f*W[2]*scale[4*g+2], 128.0f*W[3]*scale[4*g+3] };
+    }
+}
+
+template <typename BLK, void (*DEC)(const BLK *, int8_t[QK_K], float[16])>
+static void repack_grid16(const BLK * A, int64_t lda, int64_t m, int64_t k, agrid16_t * P) {
+    const int64_t nsb = k/QK_K, ns = sl(k);
+    for (int64_t it = 0; it < rt(m); it++)
+    for (int64_t s = 0; s < ns; s++) {
+        agrid16_t * T = &P[it*ns + s];
+        const int64_t sb0 = (s*KC_CH)/8;
+        const int64_t nsl = (nsb - sb0) < KC_CH/8 ? (nsb - sb0) : KC_CH/8;
+        for (int64_t sb = 0; sb < nsl; sb++) {
+            int8_t code[MR][QK_K]; float sc[MR][16];
+            for (int r = 0; r < MR; r++) {
+                int64_t rr = it*MR + r; if (rr >= m) rr = m - 1;
+                DEC(&A[rr*lda + sb0 + sb], code[r], sc[r]);
+            }
+            for (int c = 0; c < 16; c++) {
+                vsc w[MR]; float scale[MR];
+                for (int r = 0; r < MR; r++) {
+                    memcpy(&w[r], code[r] + 16*c, 16);
+                    scale[r] = sc[r][c];
+                }
+                grid16_place_chunk(T, 16*sb + c, w, scale);
+            }
+        }
+    }
+}
+
+extern "C" void grid16_repack_iq2_xs(const block_iq2_xs * A, int64_t lda, int64_t m, int64_t k, void * p) {
+    repack_grid16<block_iq2_xs, dec16_iq2_xs>(A, lda, m, k, (agrid16_t *)p); }
+extern "C" void grid16_repack_iq2_s(const block_iq2_s * A, int64_t lda, int64_t m, int64_t k, void * p) {
+    repack_grid16<block_iq2_s, dec16_iq2_s>(A, lda, m, k, (agrid16_t *)p); }
+extern "C" void grid16_repack_iq1_m(const block_iq1_m * A, int64_t lda, int64_t m, int64_t k, void * p) {
+    repack_grid16<block_iq1_m, dec16_iq1_m>(A, lda, m, k, (agrid16_t *)p); }
+
+extern "C" void grid16_pack_b_q8_K(const block_q8_K * B, int64_t ldb,
+                                   int64_t n, int64_t k, void * packed) {
+    bgrid16_t * P = (bgrid16_t *)packed;
+    const int64_t nsb = k/QK_K, ns = sl(k);
+    const vuc flip = vec_splats((unsigned char)0x80);
+    for (int64_t jt = 0; jt < ct(n); jt++)
+    for (int64_t s = 0; s < ns; s++) {
+        bgrid16_t * T = &P[jt*ns + s];
+        const int64_t sb0 = (s*KC_CH)/8;
+        const int64_t nsl = (nsb - sb0) < KC_CH/8 ? (nsb - sb0) : KC_CH/8;
+        for (int64_t sb = 0; sb < nsl; sb++) {
+            const block_q8_K * yb[NR]; float dB[NR];
+            for (int j = 0; j < NR; j++) {
+                int64_t jj = jt*NR + j; if (jj >= n) jj = n - 1;
+                yb[j] = &B[jj*ldb + sb0 + sb];
+                dB[j] = yb[j]->d;
+            }
+            for (int c = 0; c < 16; c++) {
+                const int64_t ch = 16*sb + c;
+                T->dB[ch][0] = (vfl){ dB[0], dB[1], dB[2], dB[3] };
+                T->dB[ch][1] = (vfl){ dB[4], dB[5], dB[6], dB[7] };
+                vui rows4[4];
+                for (int a = 0; a < 2; a++) {
+                    for (int j = 0; j < 4; j++)
+                        rows4[j] = (vui)vec_xor(
+                            load16u((const uint8_t *)(yb[4*a + j]->qs) + 16*c), flip);
+                    mma_transpose4(rows4, &T->v[ch][a], 2);
+                }
+            }
+        }
+    }
+}
+
+static void kernel_grid16_8x8(const agrid16_t * PA, const bgrid16_t * PB,
+                              int64_t nch, vfl fin[MR][2]) {
+    for (int64_t ch = 0; ch < nch; ch++) {
+        const vuc * a = PA->v[ch];
+        const vuc * y = PB->v[ch];
+        if (ch + 1 < nch) {
+            __builtin_prefetch(PA->v[ch + 1], 0, 3);
+            __builtin_prefetch(PB->v[ch + 1], 0, 3);
+        }
+        __vector_quad acc[2][2];
+        for (int g = 0; g < 2; g++)
+            for (int cgi = 0; cgi < 2; cgi++)
+                __builtin_mma_xxsetaccz(&acc[g][cgi]);
+        for (int x = 0; x < 4; x++) {
+            const vuc w0 = a[2*x], w1 = a[2*x + 1];
+            const vuc y0 = y[2*x], y1 = y[2*x + 1];
+            __builtin_mma_xvi8ger4pp(&acc[0][0], w0, y0);
+            __builtin_mma_xvi8ger4pp(&acc[0][1], w0, y1);
+            __builtin_mma_xvi8ger4pp(&acc[1][0], w1, y0);
+            __builtin_mma_xvi8ger4pp(&acc[1][1], w1, y1);
+        }
+        for (int g = 0; g < 2; g++) {
+            const vfl sA   = PA->sA  [ch][g];
+            const vfl C128 = PA->C128[ch][g];
+            for (int cgi = 0; cgi < 2; cgi++) {
+                vsi rowsP[4];
+                __builtin_mma_disassemble_acc(rowsP, &acc[g][cgi]);
+                const vfl dB = PB->dB[ch][cgi];
+                for (int r = 0; r < 4; r++) {
+                    vfl t = vec_msub(vec_ctf(rowsP[r],0),
+                                     vec_splats(sA[r]), vec_splats(C128[r]));
+                    fin[4*g + r][cgi] = vec_madd(t, dB, fin[4*g + r][cgi]);
+                }
+            }
+        }
+    }
+}
+
+extern "C" void grid16_gemm_packed(int64_t m, int64_t n, int64_t k,
+                                   const void * packedA, const void * packedB,
+                                   float * C, int64_t ldc, int ith, int nth) {
+    const agrid16_t * PA = (const agrid16_t *)packedA;
+    const bgrid16_t * PB = (const bgrid16_t *)packedB;
+    const int64_t kc16 = k/16, ns = sl(k), mt = rt(m), njt = ct(n);
+    const int64_t tpt = (mt + nth - 1) / nth;
+    const int64_t t0 = ith*tpt, t1 = (ith+1)*tpt < mt ? (ith+1)*tpt : mt;
+    vfl fin[MR][2];
+    for (int64_t it = t0; it < t1; it++) {
+        const int64_t i = it*MR;
+        const int64_t rows = (m - i) < MR ? (m - i) : MR;
+        for (int64_t jt = 0; jt < njt; jt++) {
+            for (int r = 0; r < MR; r++) fin[r][0] = fin[r][1] = vec_splats(0.0f);
+            for (int64_t s = 0; s < ns; s++) {
+                const int64_t c0 = s*KC_CH16;
+                const int64_t nch = (kc16 - c0) < KC_CH16 ? (kc16 - c0) : KC_CH16;
+                kernel_grid16_8x8(&PA[it*ns + s], &PB[jt*ns + s], nch, fin);
+            }
+            const int64_t j0 = jt*NR;
+            const int64_t cols = (n - j0) < NR ? (n - j0) : NR;
+            for (int64_t r = 0; r < rows; r++)
+                for (int64_t cj = 0; cj < cols; cj++)
+                    C[(i + r) + (j0 + cj)*ldc] = fin[r][cj >> 2][cj & 3];
+        }
+    }
+}
+
 #endif // __MMA__
 
 // ---------------------------------------------------------------------------
@@ -527,6 +777,91 @@ static void fill_i1s(block_iq1_s * b) {
     for (int i = 0; i < QK_K/32; i++) b->qh[i] = (uint16_t)(xr() & 0xffff);
 }
 
+template <typename BLK, void (*DEC)(const BLK *, int8_t[QK_K], float[16]),
+          void (*REPACK)(const BLK *, int64_t, int64_t, int64_t, void *),
+          void (*FILL)(BLK *)>
+static int run16(const char * name) {
+    struct { int64_t m, n, k; } cases[] = {
+        { 8, 8, 256 }, { 16, 16, 512 }, { 13, 7, 768 },
+        { 40, 24, 4096 }, { 32, 1, 2048 }, { 9, 3, 4352 },
+    };
+    int fails = 0;
+    for (auto & tc : cases) {
+        const int64_t m = tc.m, n = tc.n, k = tc.k;
+        const int64_t lda = k/QK_K, ldb = k/QK_K, ldc = m;
+        BLK * A = (BLK*)aligned_alloc(64, ((m*lda*sizeof(BLK))+63)&~63ul);
+        block_q8_K * B = (block_q8_K*)aligned_alloc(64, ((n*ldb*sizeof(block_q8_K))+63)&~63ul);
+        float * C = (float*)aligned_alloc(64, ((m*n*sizeof(float))+63)&~63ul);
+        for (int64_t i = 0; i < m*lda; i++) FILL(&A[i]);
+        for (int64_t i = 0; i < n*ldb; i++) {
+            B[i].d = 0.001f + (xr()%1000)/500000.0f;
+            for (int b = 0; b < QK_K; b++) B[i].qs[b] = (int8_t)((int)(xr()%255) - 127);
+            for (int g = 0; g < QK_K/16; g++) {
+                int sm = 0; for (int l = 0; l < 16; l++) sm += B[i].qs[16*g + l];
+                B[i].bsums[g] = (int16_t)sm;
+            }
+        }
+        void * PA = aligned_alloc(64, grid16_apack_size(m, k));
+        void * PB = aligned_alloc(64, grid16_bpack_size(n, k));
+        REPACK(A, lda, m, k, PA);
+        grid16_pack_b_q8_K(B, ldb, n, k, PB);
+        grid16_gemm_packed(m, n, k, PA, PB, C, ldc, 0, 2);
+        grid16_gemm_packed(m, n, k, PA, PB, C, ldc, 1, 2);
+        double emax = 0, scale = 0;
+        int8_t code[QK_K]; float sc[16];
+        for (int64_t i = 0; i < m; i++)
+            for (int64_t j = 0; j < n; j++) {
+                double ref = 0;
+                for (int64_t sb = 0; sb < k/QK_K; sb++) {
+                    DEC(&A[i*lda + sb], code, sc);
+                    double bacc = 0;
+                    for (int c = 0; c < 16; c++) {
+                        long P = 0;
+                        for (int l = 0; l < 16; l++) P += (long)code[16*c + l] * B[j*ldb + sb].qs[16*c + l];
+                        bacc += (double)sc[c] * (double)P;
+                    }
+                    ref += (double)B[j*ldb + sb].d * bacc;
+                }
+                scale += fabs(ref);
+                double e = fabs((double)C[i + j*ldc] - ref);
+                if (e > emax) emax = e;
+            }
+        scale = scale/(m*n) + 1e-30; emax /= scale;
+        bool ok = emax < 1e-5;
+        printf("%-8s m=%3lld n=%3lld k=%5lld  err=%.3g  %s\n",
+               name, (long long)m,(long long)n,(long long)k, emax, ok?"OK":"FAIL");
+        if (!ok) fails++;
+        free(A); free(B); free(C); free(PA); free(PB);
+    }
+    return fails;
+}
+
+static void fill_i2xs(block_iq2_xs * b) {
+    b->d = f32_to_f16_approx(0.001f + (xr()%1000)/400000.0f);
+    for (int i = 0; i < QK_K/8; i++) b->qs[i] = (uint16_t)(xr() & 0xffff);
+    for (int i = 0; i < QK_K/32; i++) b->scales[i] = (uint8_t)(xr() & 0xff);
+}
+static void fill_i2s(block_iq2_s * b) {
+    b->d = f32_to_f16_approx(0.001f + (xr()%1000)/400000.0f);
+    for (int i = 0; i < QK_K/4; i++)  b->qs[i] = (uint8_t)(xr() & 0xff);
+    for (int i = 0; i < QK_K/32; i++) b->qh[i] = (uint8_t)(xr() & 0xff);
+    for (int i = 0; i < QK_K/32; i++) b->scales[i] = (uint8_t)(xr() & 0xff);
+}
+static void fill_i1m(block_iq1_m * b) {
+    for (int i = 0; i < QK_K/8; i++)  b->qs[i] = (uint8_t)(xr() & 0xff);
+    for (int i = 0; i < QK_K/16; i++) b->qh[i] = (uint8_t)(xr() & 0xff);
+    // random scales, retried until the reassembled fp16 super-scale is a
+    // normal finite value (as any real quantizer output is)
+    for (;;) {
+        for (int i = 0; i < QK_K/32; i++) b->scales[i] = (uint8_t)(xr() & 0xff);
+        const uint16_t * scw = (const uint16_t *)b->scales;
+        uint16_t du16 = (uint16_t)((scw[0] >> 12) | ((scw[1] >> 8) & 0x00f0) |
+                                   ((scw[2] >> 4) & 0x0f00) | (scw[3] & 0xf000));
+        const int exp = (du16 >> 10) & 0x1f;
+        if (exp != 0 && exp != 0x1f) break;
+    }
+}
+
 int main() {
     int fails = 0;
     fails += run<block_tq2_0,   dec_tq2_0,   grid_repack_tq2_0,   fill_tq2>("tq2_0");
@@ -535,6 +870,9 @@ int main() {
     fails += run<block_iq3_xxs, dec_iq3_xxs, grid_repack_iq3_xxs, fill_i3xxs>("iq3_xxs");
     fails += run<block_iq3_s,   dec_iq3_s,   grid_repack_iq3_s,   fill_i3s>("iq3_s");
     fails += run<block_iq1_s,   dec_iq1_s,   grid_repack_iq1_s,   fill_i1s>("iq1_s");
+    fails += run16<block_iq2_xs, dec16_iq2_xs, grid16_repack_iq2_xs, fill_i2xs>("iq2_xs");
+    fails += run16<block_iq2_s,  dec16_iq2_s,  grid16_repack_iq2_s,  fill_i2s>("iq2_s");
+    fails += run16<block_iq1_m,  dec16_iq1_m,  grid16_repack_iq1_m,  fill_i1m>("iq1_m");
     printf(fails ? "SOME TESTS FAILED\n" : "ALL TESTS PASSED\n");
     return fails ? 1 : 0;
 }

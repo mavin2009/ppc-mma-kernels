@@ -41,6 +41,8 @@
 typedef uint16_t ggml_half;
 
 typedef struct { ggml_half d; uint8_t qs[QK4_NL/2]; } block_iq4_nl;
+#define QK_MXFP4 32
+typedef struct { uint8_t e; uint8_t qs[QK_MXFP4/2]; } block_mxfp4;
 typedef struct {
     ggml_half d;
     uint16_t  scales_h;
@@ -51,11 +53,19 @@ typedef struct { ggml_half d; int8_t qs[QK8_0]; } block_q8_0;
 typedef struct { float d; int8_t qs[QK_K]; int16_t bsums[QK_K/16]; } block_q8_K;
 
 static_assert(sizeof(block_iq4_nl) == sizeof(ggml_half) + QK4_NL/2, "bad iq4_nl");
+static_assert(sizeof(block_mxfp4) == 1 + QK_MXFP4/2, "bad mxfp4");
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + 2 + QK_K/64 + QK_K/2, "bad iq4_xs");
 
 static const int8_t kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 };
+// MXFP4 e2m1 values, pre-doubled to integers (the E8M0 "half" scale
+// supplies the /2): {0,1,2,3,4,6,8,12} with sign.
+static const int8_t kvalues_mxfp4_[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+};
+#include <cmath>
+static inline float e8m0_half_to_fp32(uint8_t e) { return ldexpf(1.0f, (int)e - 128); }
 
 static inline float fp16_to_fp32(ggml_half h) {
     const uint32_t sign = (uint32_t)(h >> 15) << 31;
@@ -121,8 +131,8 @@ static inline void mma_transpose4(const vui rows[4], vuc * out, int stride) {
 
 // 32 signed codebook values from 16 packed bytes; elements j / j+16
 // come from qs[j] low / high nibble.  One vec_perm each.
-static inline void iq4_lookup32(const uint8_t * qs, vsc v[2]) {
-    vsc tbl; memcpy(&tbl, kvalues_iq4nl, 16);
+static inline void iq4_lookup32t(const uint8_t * qs, const int8_t * table, vsc v[2]) {
+    vsc tbl; memcpy(&tbl, table, 16);
     vuc raw = load16u((const uint8_t *)(qs) + (0));
     vuc lo  = vec_and(raw, vec_splats((unsigned char)0xF));
     vuc hi  = vec_sr(raw, vec_splats((unsigned char)4));
@@ -182,7 +192,30 @@ extern "C" void iq4nl_repack_a(const block_iq4_nl * A, int64_t lda,
                 int64_t rr = it*MR + r; if (rr >= m) rr = m - 1;
                 const block_iq4_nl * bp = &A[rr*lda + b0 + b];
                 sc[r] = fp16_to_fp32(bp->d);
-                iq4_lookup32(bp->qs, w[r]);
+                iq4_lookup32t(bp->qs, kvalues_iq4nl, w[r]);
+            }
+            iq4_place_chunk(T, b, w, sc);
+        }
+    }
+}
+
+// ---- weight repack: MXFP4 (same shape as IQ4_NL, different table+scale) ----
+extern "C" void mxfp4_repack_a(const block_mxfp4 * A, int64_t lda,
+                               int64_t m, int64_t k, void * packed) {
+    aiq4_t * P = (aiq4_t *)packed;
+    const int64_t kb = k/32, ns = sl32(k);
+    for (int64_t it = 0; it < rt8(m); it++)
+    for (int64_t s = 0; s < ns; s++) {
+        aiq4_t * T = &P[it*ns + s];
+        const int64_t b0 = s*KC_CH;
+        const int64_t nb = (kb - b0) < KC_CH ? (kb - b0) : KC_CH;
+        for (int64_t b = 0; b < nb; b++) {
+            vsc w[MR][2]; float sc[MR];
+            for (int r = 0; r < MR; r++) {
+                int64_t rr = it*MR + r; if (rr >= m) rr = m - 1;
+                const block_mxfp4 * bp = &A[rr*lda + b0 + b];
+                sc[r] = e8m0_half_to_fp32(bp->e);
+                iq4_lookup32t(bp->qs, kvalues_mxfp4_, w[r]);
             }
             iq4_place_chunk(T, b, w, sc);
         }
@@ -212,7 +245,7 @@ extern "C" void iq4xs_repack_a(const block_iq4_xs * A, int64_t lda,
                     const int ls = ((bp[r]->scales_l[ib/2] >> 4*(ib%2)) & 0xF)
                                  | (((bp[r]->scales_h >> 2*ib) & 3) << 4);
                     sc[r] = d[r] * (float)(ls - 32);
-                    iq4_lookup32(bp[r]->qs + 16*ib, w[r]);
+                    iq4_lookup32t(bp[r]->qs + 16*ib, kvalues_iq4nl, w[r]);
                 }
                 iq4_place_chunk(T, 8*sb + ib, w, sc);
             }
@@ -455,6 +488,52 @@ int main() {
         scale = scale/(m*n) + 1e-30; emax /= scale;
         bool ok = emax < 1e-5;
         printf("iq4_nl m=%3lld n=%3lld k=%5lld  err=%.3g  %s\n",
+               (long long)m,(long long)n,(long long)k, emax, ok?"OK":"FAIL");
+        if (!ok) fails++;
+        free(A); free(B); free(C); free(PA); free(PB);
+    }
+    // ---- MXFP4 ----
+    for (auto & tc : cases) {
+        const int64_t m = tc.m, n = tc.n, k = tc.k;
+        const int64_t lda = k/32, ldb = k/32, ldc = m;
+        block_mxfp4 * A = (block_mxfp4*)aligned_alloc(64, ((m*lda*sizeof(block_mxfp4))+63)&~63ul);
+        block_q8_0 * B = (block_q8_0*)aligned_alloc(64, ((n*ldb*sizeof(block_q8_0))+63)&~63ul);
+        float * C = (float*)aligned_alloc(64, ((m*n*sizeof(float))+63)&~63ul);
+        for (int64_t i = 0; i < m*lda; i++) {
+            A[i].e = (uint8_t)(120 + xr()%12);
+            for (int b = 0; b < 16; b++) A[i].qs[b] = (uint8_t)(xr() & 0xff);
+        }
+        for (int64_t i = 0; i < n*ldb; i++) {
+            B[i].d = f32_to_f16_approx(0.001f + (xr()%1000)/500000.0f);
+            for (int b = 0; b < 32; b++) B[i].qs[b] = (int8_t)((int)(xr()%255) - 127);
+        }
+        void * PA = aligned_alloc(64, iq4_apack_size(m, k));
+        void * PB = aligned_alloc(64, iq4_bpack_size(n, k));
+        mxfp4_repack_a(A, lda, m, k, PA);
+        iq4_pack_b_q8_0(B, ldb, n, k, PB);
+        iq4_gemm_packed(m, n, k, PA, PB, C, ldc, 0, 2);
+        iq4_gemm_packed(m, n, k, PA, PB, C, ldc, 1, 2);
+        double emax = 0, scale = 0;
+        for (int64_t i = 0; i < m; i++)
+            for (int64_t j = 0; j < n; j++) {
+                double ref = 0;
+                for (int64_t b = 0; b < k/32; b++) {
+                    const double d = e8m0_half_to_fp32(A[i*lda + b].e);
+                    const double dy = fp16_to_fp32(B[j*ldb + b].d);
+                    long s = 0;
+                    for (int jj = 0; jj < 16; jj++) {
+                        s += (long)kvalues_mxfp4_[A[i*lda+b].qs[jj] & 0xF] * B[j*ldb+b].qs[jj];
+                        s += (long)kvalues_mxfp4_[A[i*lda+b].qs[jj] >>  4] * B[j*ldb+b].qs[jj+16];
+                    }
+                    ref += d * dy * (double)s;
+                }
+                scale += fabs(ref);
+                double e = fabs((double)C[i + j*ldc] - ref);
+                if (e > emax) emax = e;
+            }
+        scale = scale/(m*n) + 1e-30; emax /= scale;
+        bool ok = emax < 1e-5;
+        printf("mxfp4  m=%3lld n=%3lld k=%5lld  err=%.3g  %s\n",
                (long long)m,(long long)n,(long long)k, emax, ok?"OK":"FAIL");
         if (!ok) fails++;
         free(A); free(B); free(C); free(PA); free(PB);
