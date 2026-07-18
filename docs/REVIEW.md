@@ -43,6 +43,48 @@ and what has not.
   (documented in their messages); code state is what the test matrix
   verifies.
 
+## Silicon-level review findings (pre-rollout audit)
+
+A critical pass taken from the perspective of a Power MMA architect,
+with the resulting fixes and the items only hardware can settle:
+
+**Fixed in patch 0008 (rollout hardening):**
+- *Patch-series defect*: patches 0007/0008 had been generated from the
+  same baseline and overlapped, so the one-command build script could
+  not apply them in sequence. The series was regenerated from proper
+  per-patch baselines and is now gated: all eight patches apply cleanly
+  in sequence on a pristine checkout of the pinned base commit, and the
+  resulting tree is byte-identical to the build-verified tree.
+- *Cache thrash hazard*: round-robin eviction meant a working set
+  exceeding the cap would re-pack every tensor every token — worse
+  than no cache. Replaced with admission-without-eviction: cached
+  tensors win permanently, everything else runs exactly at the
+  per-call baseline. The cache's effect is now monotonic.
+- *Stale-pack hazard on model reload*: pointer-identity keying could
+  serve stale packs if a model unload/reload landed new weights at the
+  same address. A content fingerprint (first+last 32 bytes, FNV-1a)
+  is folded into the key, and `ppc_apack_cache_clear()` is exposed.
+- *Per-thread activation-pack duplication*: every thread packed the
+  entire B panel per call (nth-fold redundant work, worst during
+  prompt processing). On cache hits, work is now partitioned by
+  columns: each thread packs only its own activation slice. Total
+  pack work across threads equals one full pack.
+
+**Known, quantified, awaiting silicon:**
+- The 16-deep chunk kernels (per-16-scale formats and NVFP4) issue 16
+  GERs per accumulator drain vs 64 for the 32-deep kernels — an
+  inherently worse MMA-to-fixup ratio forced by the formats' scale
+  granularity. Only hardware can say how much it costs.
+- First touch of each tensor packs the full matrix on one thread while
+  peers wait (cold-start latency, amortized over the model lifetime).
+- xvi8ger4pp operand-signedness semantics were established empirically
+  under qemu; silicon agreement is expected but is exactly what the
+  temperature-0 check exists to confirm.
+- fp32 output accumulation matches ggml's own vec_dot baseline; no
+  extended-precision claim is made for very large k.
+- n == 1 uses the no-packing GEMV path for Q1_0/Q2_0 only; other
+  formats run the GEMM path with padded tiles at n=1.
+
 ## Suggested review order
 
 1. `docs/DESIGN.md` — the algebra and the microarchitectural argument.
