@@ -5,7 +5,8 @@ is mechanical. Ready-made patches implementing this live in `patches/`:
 `0001-power-mma-q1-q2-sgemm.patch` (Q1_0/Q2_0) and
 `0002-power-mma-kquants-sgemm.patch` (Q4_K/Q5_K/Q6_K/Q2_K x Q8_K),
 `0003-power-mma-q3k-iq4-sgemm.patch` (Q3_K x Q8_K, IQ4_NL x Q8_0,
-IQ4_XS x Q8_K,
+IQ4_XS x Q8_K),
+`0004-power-mma-legacy-sgemm.patch` (Q4_1/Q5_1 x Q8_1, Q5_0 x Q8_0,
 with a one-shot driver that packs the calling thread's row tiles per
 call -- correct but not the final performance shape; the load-time
 repack.cpp integration is the follow-up). All are applied

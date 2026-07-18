@@ -169,6 +169,13 @@ orientation's write-back). The same technique extends to the wider IQ
 family (IQ2/IQ3 grids are larger codebooks with sign masks); those
 remain future work.
 
+**Legacy quants (Q4_1/Q5_0/Q5_1).** All unsigned codes, v3
+orientation. Q5_0 is offset form (t = q − 16) with the correction
+folded as usual. Q4_1/Q5_1 are affine (value = d·q + m) against Q8_1 —
+whose block stores s = dB·Σy precomputed by ggml's quantizer, so the
+min term reduces to `fin += mA · s` — one vec_madd with no sum computed
+anywhere in this project's code.
+
 **Register-pressure note (K-quants).** Static analysis of the K-quant
 hot loops shows ~50–85 stack vector ops per chunk iteration, versus
 ~0–8 for v3. This is structural, not a codegen accident: the fixup
