@@ -45,6 +45,14 @@ five kernel TUs and `llama-cli` runs under qemu-power10) --
 and builds `llama-cli` / `llama-server` / `llama-bench`. Details and
 model download in [docs/DEPLOY.md](docs/DEPLOY.md).
 
+## Virtualized performance snapshot
+
+Measured qemu-emulation numbers — same-workload kernel comparisons,
+suite runtimes, and exact static instruction accounting — live in
+[docs/BENCHMARKS-QEMU.md](docs/BENCHMARKS-QEMU.md), with an explicit
+statement of what emulated numbers can and cannot show. No absolute
+hardware claims are made anywhere in this repo.
+
 ## For reviewers
 
 See [docs/REVIEW.md](docs/REVIEW.md) for the verification matrix: what
