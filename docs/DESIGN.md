@@ -228,6 +228,55 @@ spill traffic itself is an accumulator-file constraint, not a codegen
 bug; attacking it means smaller fin footprints (4-row tiles) — a
 hardware-measurable tradeoff, not a static one.
 
+**POWER10/11 feature assessment (beyond what the kernels already use).**
+Each remaining ISA 3.1 capability, with status:
+
+*lxvp/stxvp vector-pair memory ops* — experiment run on the 32-deep
+signed kernel: GER-feed loads became 24 lxvp + spill traffic, but GCC's
+pair disassembly inserts xxlor moves, regressing the static count 276 →
+308. Unlike the splat-hoist negative result, this proxy verdict is
+suspect: xxlor is near-free on silicon and lxvp consumes one dispatch
+slot across both LSU halves, so hardware may invert the result. Status:
+hardware-decidable; the experiment is a 10-line diff reproducible from
+this note.
+
+*pmxvi8ger4pp (prefixed masked GER)* — XMSK/YMSK/PMSK masking could
+replace the row-clamping edge handling and depth-tail logic with
+masked tiles. Expected perf-neutral (edges are rare); a code-clarity
+and correctness-surface win. Status: good first hardware-era cleanup.
+
+*xvbf16ger2pp scale folding* — folding quantization scales into bf16
+weights at repack would delete the entire float fixup (no ctf/msub/
+madd, no dB application): the accumulator would hold final floats.
+Cost: 2-deep GERs double the GER count, activations widen to 16-bit
+(2x B traffic), and — decisively — results would no longer be
+bit-comparable with ggml's integer-exact path, breaking the
+temperature-0 verification story. Status: rejected for numerical
+parity; the math is recorded here should a fast-mode variant ever be
+wanted.
+
+*xvi16ger2pp* — no fit: activations are already int8 and 4-deep int8
+GERs dominate 2-deep int16 for this workload.
+
+*dcbt stream variants (TH field)* — one stream-setup touch per slab
+could replace the per-chunk software prefetch and engage the hardware
+stream prefetcher explicitly. Status: hardware-tunable; the current
+per-chunk dcbt is the conservative baseline.
+
+*dcbz on C tiles* — avoids read-for-ownership on output stores; C
+traffic is small relative to packed panels. Status: marginal, untried.
+
+*Prefixed loads/pcrel* — already emitted by GCC under -mcpu=power10.
+
+*POWER11* — same user-level ISA (3.1 family); its gains for these
+kernels come from frequency and memory bandwidth, which benefits the
+bandwidth-bound GEMV path most. No P11-specific code paths are
+warranted.
+
+*OS-level* — the pack cache's large stable allocations are natural
+transparent-hugepage candidates on radix MMU systems; worth checking
+THP engagement during hardware bring-up.
+
 **Register-pressure note (K-quants).** Static analysis of the K-quant
 hot loops shows ~50–85 stack vector ops per chunk iteration, versus
 ~0–8 for v3. This is structural, not a codegen accident: the fixup
