@@ -15,7 +15,9 @@ well-defined unaligned loads, C11-conformant aligned_alloc sizes),
 NVFP4 dispatch; tensor-keyed weight-pack cache; qbit upgraded to the
 v4 packed API with no-packing GEMV for n == 1),
 `0008-power-mma-rollout-hardening.patch` (cache admission policy,
-content fingerprinting, column-partitioned activation packing,
+content fingerprinting, column-partitioned activation packing),
+`0009-power-mma-prefetch.patch` (full-cacheline prefetch of packed
+panels,
 with a one-shot driver that packs the calling thread's row tiles per
 call -- correct but not the final performance shape; the load-time
 repack.cpp integration is the follow-up). All are applied

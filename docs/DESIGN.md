@@ -208,6 +208,26 @@ on any miss-with-full-cache or allocation failure callers fall back to
 the per-call path — never wrong, only slower. The immutability
 assumption and its limits are stated in the source header for review.
 
+**Micro-optimization pass (measured, including a negative result).**
+Static instruction accounting of the compiled signed kernels (GCC 14,
+-O3 -mcpu=power10) per 2048-element-slab chunk iteration: the 32-deep
+kernel runs 272 instructions for 32 GERs (7.5 non-GER per GER); the
+16-deep kernel runs 228 for 16 (13.25 per GER) — quantifying the
+per-16-scale formats' inherent fixup overhead. Of the non-GER work,
+~28 stores + a similar share of the 68 loads are GCC's
+disassemble-to-stack bounce and `fin` spill under accumulator aliasing
+pressure. Attempting to hoist the per-rowgroup scale splats out of the
+column-group loop — both as arrays and fully unrolled into named
+registers — *regressed* both kernels to 304/256 instructions: the
+eight extra live values displace other state into spills, and GCC's
+baseline (recomputing splats per column group) is the local optimum.
+The change kept from this pass is prefetch widening: each chunk's
+packed panel spans two 128B lines and both are now touched (+4
+instructions, memory-latency benefit only hardware can price). The
+spill traffic itself is an accumulator-file constraint, not a codegen
+bug; attacking it means smaller fin footprints (4-row tiles) — a
+hardware-measurable tradeoff, not a static one.
+
 **Register-pressure note (K-quants).** Static analysis of the K-quant
 hot loops shows ~50–85 stack vector ops per chunk iteration, versus
 ~0–8 for v3. This is structural, not a codegen accident: the fixup

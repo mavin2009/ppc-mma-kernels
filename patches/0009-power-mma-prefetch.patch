@@ -1,0 +1,44 @@
+diff --git a/ggml/src/ggml-cpu/llamafile/iq4_ppc_mma.cpp b/ggml/src/ggml-cpu/llamafile/iq4_ppc_mma.cpp
+index 7f2a60c..5388620 100644
+--- a/ggml/src/ggml-cpu/llamafile/iq4_ppc_mma.cpp
++++ b/ggml/src/ggml-cpu/llamafile/iq4_ppc_mma.cpp
+@@ -278,8 +278,11 @@ static void kernel_iq4_8x8(const aiq4_t * PA, const biq4_t * PB,
+         const vuc * a = PA->v[ch];
+         const vuc * y = PB->v[ch];
+         if (ch + 1 < nch) {
++            // each chunk's packed panel spans two 128B lines; touch both
+             __builtin_prefetch(PA->v[ch + 1], 0, 3);
++            __builtin_prefetch((const char *)PA->v[ch + 1] + 128, 0, 3);
+             __builtin_prefetch(PB->v[ch + 1], 0, 3);
++            __builtin_prefetch((const char *)PB->v[ch + 1] + 128, 0, 3);
+         }
+         __vector_quad acc[2][2];
+         for (int g = 0; g < 2; g++)
+diff --git a/ggml/src/ggml-cpu/llamafile/iq_grid_ppc_mma.cpp b/ggml/src/ggml-cpu/llamafile/iq_grid_ppc_mma.cpp
+index 1f8d7dd..41fefa6 100644
+--- a/ggml/src/ggml-cpu/llamafile/iq_grid_ppc_mma.cpp
++++ b/ggml/src/ggml-cpu/llamafile/iq_grid_ppc_mma.cpp
+@@ -438,8 +438,11 @@ static void kernel_grid_8x8(const agrid_t * PA, const bgrid_t * PB,
+         const vuc * a = PA->v[ch];
+         const vuc * y = PB->v[ch];
+         if (ch + 1 < nch) {
++            // each chunk's packed panel spans two 128B lines; touch both
+             __builtin_prefetch(PA->v[ch + 1], 0, 3);
++            __builtin_prefetch((const char *)PA->v[ch + 1] + 128, 0, 3);
+             __builtin_prefetch(PB->v[ch + 1], 0, 3);
++            __builtin_prefetch((const char *)PB->v[ch + 1] + 128, 0, 3);
+         }
+         __vector_quad acc[2][2];
+         for (int g = 0; g < 2; g++)
+@@ -673,8 +676,11 @@ static void kernel_grid16_8x8(const agrid16_t * PA, const bgrid16_t * PB,
+         const vuc * a = PA->v[ch];
+         const vuc * y = PB->v[ch];
+         if (ch + 1 < nch) {
++            // each chunk's packed panel spans two 128B lines; touch both
+             __builtin_prefetch(PA->v[ch + 1], 0, 3);
++            __builtin_prefetch((const char *)PA->v[ch + 1] + 128, 0, 3);
+             __builtin_prefetch(PB->v[ch + 1], 0, 3);
++            __builtin_prefetch((const char *)PB->v[ch + 1] + 128, 0, 3);
+         }
+         __vector_quad acc[2][2];
+         for (int g = 0; g < 2; g++)
