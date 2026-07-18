@@ -1,0 +1,63 @@
+# ppc-mma-kernels
+
+POWER10/POWER11 MMA (Matrix-Multiply Assist) GEMM kernels for low-bit
+quantized LLM inference, targeting the [PrismML llama.cpp fork's](https://github.com/PrismML-Eng/llama.cpp)
+1-bit (`Q1_0`) and ternary (`Q2_0`) weight formats against `Q8_0`-quantized
+activations.
+
+Mainline llama.cpp accelerates `Q4_0`/`Q8_0` matmuls on Power10 via MMA
+(`tinyBLAS_Q0_PPC`), but the 1-bit/ternary formats fall back to scalar
+code — throwing away Power's main trick on exactly the layers that
+dominate compute. These kernels close that gap.
+
+## Kernels
+
+| File | What it is |
+|---|---|
+| `src/q1_0_ppc_mma.cpp` | v1: 4x4 tile, single accumulator, `Q1_0` × `Q8_0` |
+| `src/q2_0_ppc_mma.cpp` | v1: same structure for ternary `Q2_0` × `Q8_0` |
+| `src/q1_0_ppc_mma_v2.cpp` | v2: hoisted packing, K-slab blocking, 8x8 tile on 4 accumulators |
+| `src/qbit_ppc_mma_v3.cpp` | v3: unified `Q1_0`+`Q2_0`, unsigned-code formulation with separable correction, 16x8 tile on all 8 accumulators |
+
+See [docs/DESIGN.md](docs/DESIGN.md) for the derivation and the
+microarchitectural rationale, and [docs/INTEGRATION.md](docs/INTEGRATION.md)
+for wiring into ggml/llama.cpp.
+
+## Correctness
+
+Every kernel ships with a self-checking test (`-DQ*_TEST`) that compares
+against an exact double-precision reference over random data, covering
+ragged tile edges, single-column (token generation) shapes, multi-slab K,
+and the full ternary code range. Verified via cross-compilation and
+`qemu-ppc64le -cpu power10` emulation; max normalized error is at the
+same level as the scalar float reference (~1e-6).
+
+## Quick start (cross + qemu, e.g. on x86 Ubuntu 24.04)
+
+```sh
+sudo apt-get install g++-14-powerpc64le-linux-gnu qemu-user
+make CROSS=powerpc64le-linux-gnu- CXX=powerpc64le-linux-gnu-g++-14 test
+```
+
+On real Power10/Power11 hardware:
+
+```sh
+make CROSS= QEMU= test bench
+```
+
+## Status / honest caveats
+
+- Correctness is machine-verified (qemu). **Performance is not**: qemu
+  prices every instruction equally, so it can serve only as a rough
+  dynamic-instruction-count proxy. v2 measured ~23% fewer emulated
+  instructions than v1; v3's advantages (8 independent accumulator
+  chains, prefetch, halved per-output companion work) are exactly the
+  ones emulation cannot see. Benchmark on silicon before trusting any
+  ranking between v2 and v3.
+- The GEMM-side packing here is per-thread; in a real ggml integration
+  the weight pack belongs in `repack.cpp` at model load and the
+  activation pack next to activation quantization.
+
+## License
+
+MIT
