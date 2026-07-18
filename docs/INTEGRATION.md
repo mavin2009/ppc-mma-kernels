@@ -1,9 +1,12 @@
 # Integrating into the PrismML llama.cpp fork
 
 These kernels use llamafile-sgemm conventions on purpose so the wiring
-is mechanical. **This integration is described but not machine-tested**
-(building the full fork for ppc64le was out of scope); treat it as a
-map, not a patch.
+is mechanical. A ready-made patch implementing exactly this lives in
+`patches/0001-power-mma-q1-q2-sgemm.patch`, applied automatically by
+`scripts/build-bonsai-power.sh`. **Verification status**: the patched
+fork cross-compiles cleanly for ppc64le and the resulting `llama-cli`
+executes under qemu-power10; end-to-end inference through the patched
+dispatch still needs a first run on hardware (see DEPLOY.md step 5).
 
 ## Where to hook
 

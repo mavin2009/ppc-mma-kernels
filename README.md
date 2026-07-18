@@ -20,8 +20,21 @@ dominate compute. These kernels close that gap.
 | `src/qbit_ppc_mma_v3.cpp` | v3: unified `Q1_0`+`Q2_0`, unsigned-code formulation with separable correction, 16x8 tile on all 8 accumulators |
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the derivation and the
-microarchitectural rationale, and [docs/INTEGRATION.md](docs/INTEGRATION.md)
-for wiring into ggml/llama.cpp.
+microarchitectural rationale, [docs/INTEGRATION.md](docs/INTEGRATION.md)
+for how the wiring works, and [docs/DEPLOY.md](docs/DEPLOY.md) for the
+end-to-end path to running Bonsai on a Power machine.
+
+## Deploy Bonsai on Power
+
+```sh
+./scripts/build-bonsai-power.sh
+```
+
+clones the PrismML fork at a pinned commit, applies
+`patches/0001-power-mma-q1-q2-sgemm.patch` (verified: the patched fork
+cross-compiles for ppc64le and `llama-cli` runs under qemu-power10),
+and builds `llama-cli` / `llama-server` / `llama-bench`. Details and
+model download in [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## Correctness
 
