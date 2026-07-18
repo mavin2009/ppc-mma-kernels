@@ -8,7 +8,9 @@ is mechanical. Ready-made patches implementing this live in `patches/`:
 IQ4_XS x Q8_K),
 `0004-power-mma-legacy-sgemm.patch` (Q4_1/Q5_1 x Q8_1, Q5_0 x Q8_0),
 `0005-power-mma-grids-ternary-sgemm.patch` (TQ1_0/TQ2_0, IQ2_XXS,
-IQ3_XXS, IQ3_S, IQ1_S x Q8_K,
+IQ3_XXS, IQ3_S, IQ1_S x Q8_K),
+`0006-power-mma-robustness.patch` (GGML_ABORT on pack-alloc failure,
+well-defined unaligned loads, C11-conformant aligned_alloc sizes,
 with a one-shot driver that packs the calling thread's row tiles per
 call -- correct but not the final performance shape; the load-time
 repack.cpp integration is the follow-up). All are applied

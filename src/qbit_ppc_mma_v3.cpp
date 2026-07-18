@@ -61,8 +61,7 @@
 // in q8 blocks, C column-major float (C[i + j*ldc]); k % 128 == 0.
 //
 // Build (cross):
-//   powerpc64le-linux-gnu-g++ -O3 -mcpu=power10 -DQBIT_TEST \
-//       qbit_ppc_mma_v3.cpp -o qbit_v3_test
+//   powerpc64le-linux-gnu-g++ -O3 -mcpu=power10 -DQBIT_TEST qbit_ppc_mma_v3.cpp -o qbit_v3_test
 //   qemu-ppc64le -cpu power10 -L /usr/powerpc64le-linux-gnu ./qbit_v3_test
 
 #include <altivec.h>
@@ -111,6 +110,12 @@ typedef vector signed char    vsc;
 typedef vector unsigned int   vui;
 typedef vector signed int     vsi;
 typedef vector float          vfl;
+
+// Unaligned 16-byte load via memcpy: compiles to a single lxv (which is
+// alignment-agnostic on POWER) while staying well-defined C++ for any
+// source alignment -- several block structs place qs at odd offsets.
+static inline vuc load16u(const void * p) { vuc v; memcpy(&v, p, 16); return v; }
+
 
 #define KC_BLKS   16                       // 2048-element K slab
 #define KC_CHUNKS (KC_BLKS * 4)
@@ -177,7 +182,7 @@ static void pack_A16_q1(const block_q1_0 * A, int64_t lda, int64_t rows,
             int64_t rr = r < rows ? r : rows - 1;
             const block_q1_0 * bp = &A[rr*lda + blk0 + b];
             d[r]   = fp16_to_fp32(bp->d);
-            raw[r] = vec_xl(0, (const unsigned char *)bp->qs);
+            raw[r] = load16u((const uint8_t *)(bp->qs) + (0));
         }
         for (int g = 0; g < 4; g++)
             P->dA[b][g] = (vfl){ d[4*g], d[4*g+1], d[4*g+2], d[4*g+3] };
@@ -203,8 +208,8 @@ static void pack_A16_q2(const block_q2_0 * A, int64_t lda, int64_t rows,
             int64_t rr = r < rows ? r : rows - 1;
             const block_q2_0 * bp = &A[rr*lda + blk0 + b];
             d[r]  = fp16_to_fp32(bp->d);
-            lo[r] = vec_xl(0,  (const unsigned char *)bp->qs);
-            hi[r] = vec_xl(16, (const unsigned char *)bp->qs);
+            lo[r] = load16u((const uint8_t *)(bp->qs) + (0));
+            hi[r] = load16u((const uint8_t *)(bp->qs) + (16));
         }
         for (int g = 0; g < 4; g++)
             P->dA[b][g] = (vfl){ d[4*g], d[4*g+1], d[4*g+2], d[4*g+3] };
@@ -241,8 +246,8 @@ static void pack_B8(const block_q8_0 * B, int64_t ldb, int64_t cols,
             for (int a = 0; a < 2; a++) {
                 vuc q[4][2];
                 for (int j = 0; j < 4; j++) {
-                    q[j][0] = vec_xl(0,  (const unsigned char *)yb[4*a + j]->qs);
-                    q[j][1] = vec_xl(16, (const unsigned char *)yb[4*a + j]->qs);
+                    q[j][0] = load16u((const uint8_t *)(yb[4*a + j]->qs) + (0));
+                    q[j][1] = load16u((const uint8_t *)(yb[4*a + j]->qs) + (16));
                     vsi z = vec_splats(0);
                     vsi s = vec_sum4s((vsc)q[j][0], z);
                     s = vec_sum4s((vsc)q[j][1], s);

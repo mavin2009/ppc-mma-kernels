@@ -45,6 +45,13 @@ five kernel TUs and `llama-cli` runs under qemu-power10) --
 and builds `llama-cli` / `llama-server` / `llama-bench`. Details and
 model download in [docs/DEPLOY.md](docs/DEPLOY.md).
 
+## For reviewers
+
+See [docs/REVIEW.md](docs/REVIEW.md) for the verification matrix: what
+is machine-verified (numerics vs float64 references, -Werror, UBSan,
+cross-build of all six integration patches) and what still requires
+hardware (end-to-end inference, all performance claims).
+
 ## Correctness
 
 Every kernel ships with a self-checking test (`-DQ*_TEST`) that compares

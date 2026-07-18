@@ -39,8 +39,7 @@
 //   k must be a multiple of 128 (QK2_0).
 //
 // Build (cross):
-//   powerpc64le-linux-gnu-g++ -O3 -mcpu=power10 -DQ2MMA_TEST \
-//       q2_0_ppc_mma.cpp -o q2mma_test
+//   powerpc64le-linux-gnu-g++ -O3 -mcpu=power10 -DQ2MMA_TEST q2_0_ppc_mma.cpp -o q2mma_test
 //   qemu-ppc64le -cpu power10 -L /usr/powerpc64le-linux-gnu ./q2mma_test
 
 #include <altivec.h>
@@ -98,6 +97,12 @@ typedef vector signed char    vsc;
 typedef vector unsigned int   vui;
 typedef vector signed int     vsi;
 typedef vector float          vfl;
+
+// Unaligned 16-byte load via memcpy: compiles to a single lxv (which is
+// alignment-agnostic on POWER) while staying well-defined C++ for any
+// source alignment -- several block structs place qs at odd offsets.
+static inline vuc load16u(const void * p) { vuc v; memcpy(&v, p, 16); return v; }
+
 
 // Unpack chunk c (32 elements) of a Q2_0 block from its preloaded 32 qs
 // bytes (lo = qs[0..15], hi = qs[16..31]).  Loading the block's qs exactly
@@ -159,8 +164,8 @@ static void q2mma_tile4x4(int64_t k,
 
         vuc rawLo[4], rawHi[4];
         for (int i = 0; i < 4; i++) {
-            rawLo[i] = vec_xl(0,  (const unsigned char *)A[i][blk].qs);
-            rawHi[i] = vec_xl(16, (const unsigned char *)A[i][blk].qs);
+            rawLo[i] = load16u((const uint8_t *)(A[i][blk].qs) + (0));
+            rawHi[i] = load16u((const uint8_t *)(A[i][blk].qs) + (16));
         }
 
         for (int c = 0; c < 4; c++) {          // 4 q8 sub-chunks per q2 block
@@ -188,8 +193,8 @@ static void q2mma_tile4x4(int64_t k,
                 vuc lo[4], hi[4];
                 for (int j = 0; j < 4; j++) {
                     yb[j] = &B[j][4*blk + c];
-                    lo[j] = vec_xor(vec_xl(0,  (const unsigned char *)yb[j]->qs), flip);
-                    hi[j] = vec_xor(vec_xl(16, (const unsigned char *)yb[j]->qs), flip);
+                    lo[j] = vec_xor(load16u((const uint8_t *)(yb[j]->qs) + (0)), flip);
+                    hi[j] = vec_xor(load16u((const uint8_t *)(yb[j]->qs) + (16)), flip);
                 }
                 for (int j = 0; j < 4; j++) rows[j] = (vui)lo[j];
                 mma_transpose4(rows, vecB);

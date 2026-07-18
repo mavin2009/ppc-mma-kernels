@@ -22,8 +22,7 @@
 // per-thread buffers, which duplicates the B pack across threads.
 //
 // Build (cross):
-//   powerpc64le-linux-gnu-g++ -O3 -mcpu=power10 -DQ1MMA_TEST \
-//       q1_0_ppc_mma_v2.cpp -o q1mma_v2_test
+//   powerpc64le-linux-gnu-g++ -O3 -mcpu=power10 -DQ1MMA_TEST q1_0_ppc_mma_v2.cpp -o q1mma_v2_test
 //   qemu-ppc64le -cpu power10 -L /usr/powerpc64le-linux-gnu ./q1mma_v2_test
 
 #include <altivec.h>
@@ -69,6 +68,12 @@ typedef vector signed char    vsc;
 typedef vector unsigned int   vui;
 typedef vector signed int     vsi;
 typedef vector float          vfl;
+
+// Unaligned 16-byte load via memcpy: compiles to a single lxv (which is
+// alignment-agnostic on POWER) while staying well-defined C++ for any
+// source alignment -- several block structs place qs at odd offsets.
+static inline vuc load16u(const void * p) { vuc v; memcpy(&v, p, 16); return v; }
+
 
 // K slab: 16 Q1_0 blocks = 2048 elements = 64 q8 chunks.
 #define KC_BLKS   16
@@ -127,7 +132,7 @@ static void pack_A8(const block_q1_0 * A, int64_t lda, int64_t rows,
             int64_t rr = r < rows ? r : rows - 1;      // clamp (dup last row)
             blkp[r] = &A[rr*lda + blk0 + b];
             P->dA[b][r] = fp16_to_fp32(blkp[r]->d);
-            raw[r] = vec_xl(0, (const unsigned char *)blkp[r]->qs);
+            raw[r] = load16u((const uint8_t *)(blkp[r]->qs) + (0));
         }
         for (int c = 0; c < 4; c++) {
             const int ch = 4*b + c;
@@ -168,7 +173,7 @@ static void pack_B8(const block_q8_0 * B, int64_t ldb, int64_t cols,
             for (int h = 0; h < 2; h++) {
                 for (int j = 0; j < 4; j++)
                     rows4[j] = (vui)vec_xor(
-                        vec_xl(16*h, (const unsigned char *)yb[4*g + j]->qs), flip);
+                        load16u((const uint8_t *)(yb[4*g + j]->qs) + (16*h)), flip);
                 mma_transpose4(rows4, &P->v[ch][8*h + g], 2);
             }
     }

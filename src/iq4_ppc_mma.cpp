@@ -84,6 +84,12 @@ typedef vector unsigned int   vui;
 typedef vector signed int     vsi;
 typedef vector float          vfl;
 
+// Unaligned 16-byte load via memcpy: compiles to a single lxv (which is
+// alignment-agnostic on POWER) while staying well-defined C++ for any
+// source alignment -- several block structs place qs at odd offsets.
+static inline vuc load16u(const void * p) { vuc v; memcpy(&v, p, 16); return v; }
+
+
 #define KC_ELEMS  2048                    // K slab
 #define KC_CH     (KC_ELEMS / 32)         // 32-element chunks per slab
 #define MR        8
@@ -117,7 +123,7 @@ static inline void mma_transpose4(const vui rows[4], vuc * out, int stride) {
 // come from qs[j] low / high nibble.  One vec_perm each.
 static inline void iq4_lookup32(const uint8_t * qs, vsc v[2]) {
     vsc tbl; memcpy(&tbl, kvalues_iq4nl, 16);
-    vuc raw = vec_xl(0, (const unsigned char *)qs);
+    vuc raw = load16u((const uint8_t *)(qs) + (0));
     vuc lo  = vec_and(raw, vec_splats((unsigned char)0xF));
     vuc hi  = vec_sr(raw, vec_splats((unsigned char)4));
     v[0] = vec_perm(tbl, tbl, lo);
@@ -154,10 +160,10 @@ static inline int64_t ct8(int64_t n) { return (n + NR - 1) / NR; }
 static inline int64_t sl32(int64_t k) { return (k/32 + KC_CH - 1) / KC_CH; }
 
 extern "C" size_t iq4_apack_size(int64_t m, int64_t k) {
-    return (size_t)(rt8(m) * sl32(k)) * sizeof(aiq4_t);
+    return (((size_t)(rt8(m) * sl32(k)) * sizeof(aiq4_t)) + 63) & ~(size_t)63;
 }
 extern "C" size_t iq4_bpack_size(int64_t n, int64_t k) {
-    return (size_t)(ct8(n) * sl32(k)) * sizeof(biq4_t);
+    return (((size_t)(ct8(n) * sl32(k)) * sizeof(biq4_t)) + 63) & ~(size_t)63;
 }
 
 // ---- weight repack: IQ4_NL ----
@@ -239,7 +245,7 @@ extern "C" void iq4_pack_b_q8_0(const block_q8_0 * B, int64_t ldb,
                 for (int h = 0; h < 2; h++) {
                     for (int j = 0; j < 4; j++)
                         rows4[j] = (vui)vec_xor(
-                            vec_xl(16*h, (const unsigned char *)yb[4*a + j]->qs), flip);
+                            load16u((const uint8_t *)(yb[4*a + j]->qs) + (16*h)), flip);
                     mma_transpose4(rows4, &T->v[b][8*h + a], 2);
                 }
         }
@@ -272,7 +278,7 @@ extern "C" void iq4_pack_b_q8_K(const block_q8_K * B, int64_t ldb,
                     for (int h = 0; h < 2; h++) {
                         for (int j = 0; j < 4; j++)
                             rows4[j] = (vui)vec_xor(
-                                vec_xl(32*ib + 16*h, (const unsigned char *)yb[4*a + j]->qs), flip);
+                                load16u((const uint8_t *)(yb[4*a + j]->qs) + (32*ib + 16*h)), flip);
                         mma_transpose4(rows4, &T->v[ch][8*h + a], 2);
                     }
             }

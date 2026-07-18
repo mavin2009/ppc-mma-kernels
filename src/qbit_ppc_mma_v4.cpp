@@ -65,6 +65,12 @@ typedef vector unsigned int   vui;
 typedef vector signed int     vsi;
 typedef vector float          vfl;
 
+// Unaligned 16-byte load via memcpy: compiles to a single lxv (which is
+// alignment-agnostic on POWER) while staying well-defined C++ for any
+// source alignment -- several block structs place qs at odd offsets.
+static inline vuc load16u(const void * p) { vuc v; memcpy(&v, p, 16); return v; }
+
+
 #define KC_BLKS   16
 #define KC_CHUNKS (KC_BLKS * 4)
 #define MR        16
@@ -120,10 +126,10 @@ static inline int64_t n_col_tiles(int64_t n)  { return (n + NR - 1) / NR; }
 static inline int64_t n_slabs(int64_t k)      { return (k/128 + KC_BLKS - 1) / KC_BLKS; }
 
 extern "C" size_t qbit_apack_size(int64_t m, int64_t k) {
-    return (size_t)(n_row_tiles(m) * n_slabs(k)) * sizeof(apack_t);
+    return (((size_t)(n_row_tiles(m) * n_slabs(k)) * sizeof(apack_t)) + 63) & ~(size_t)63;
 }
 extern "C" size_t qbit_bpack_size(int64_t n, int64_t k) {
-    return (size_t)(n_col_tiles(n) * n_slabs(k)) * sizeof(bpack_t);
+    return (((size_t)(n_col_tiles(n) * n_slabs(k)) * sizeof(bpack_t)) + 63) & ~(size_t)63;
 }
 
 // packed layout: tile-major, slab-minor:  P[tile * n_slabs + slab]
@@ -161,11 +167,11 @@ static void repack_rows(const BLK * A, int64_t lda, int64_t m, int64_t k, apack_
 }
 
 static void q1_blk_codes(const block_q1_0 * bp, int c, vuc v[2]) {
-    q1_codes32(vec_xl(0, (const unsigned char *)bp->qs), c, v);
+    q1_codes32(load16u((const uint8_t *)(bp->qs) + (0)), c, v);
 }
 static void q2_blk_codes(const block_q2_0 * bp, int c, vuc v[2]) {
-    q2_codes32(vec_xl(0,  (const unsigned char *)bp->qs),
-               vec_xl(16, (const unsigned char *)bp->qs), c, v);
+    q2_codes32(load16u((const uint8_t *)(bp->qs) + (0)),
+               load16u((const uint8_t *)(bp->qs) + (16)), c, v);
 }
 
 extern "C" void qbit_repack_q1(const block_q1_0 * A, int64_t lda,
@@ -202,8 +208,8 @@ extern "C" void qbit_pack_b(const block_q8_0 * B, int64_t ldb,
                     for (int a = 0; a < 2; a++) {
                         vuc q[4][2];
                         for (int j = 0; j < 4; j++) {
-                            q[j][0] = vec_xl(0,  (const unsigned char *)yb[4*a + j]->qs);
-                            q[j][1] = vec_xl(16, (const unsigned char *)yb[4*a + j]->qs);
+                            q[j][0] = load16u((const uint8_t *)(yb[4*a + j]->qs) + (0));
+                            q[j][1] = load16u((const uint8_t *)(yb[4*a + j]->qs) + (16));
                             vsi z = vec_splats(0);
                             vsi sm = vec_sum4s((vsc)q[j][0], z);
                             sm = vec_sum4s((vsc)q[j][1], sm);
@@ -336,8 +342,8 @@ static void gemv_prep_b(const block_q8_0 * y, int64_t nch, gemv_bmeta_t * M) {
     for (int64_t c = 0; c < nch; c++) {
         M[c].dB = fp16_to_fp32(y[c].d);
         vsi z = vec_splats(0);
-        vsi s = vec_sum4s((vsc)vec_xl(0,  (const unsigned char *)y[c].qs), z);
-        s = vec_sum4s((vsc)vec_xl(16, (const unsigned char *)y[c].qs), s);
+        vsi s = vec_sum4s((vsc)load16u((const uint8_t *)(y[c].qs) + (0)), z);
+        s = vec_sum4s((vsc)load16u((const uint8_t *)(y[c].qs) + (16)), s);
         M[c].S = (float)(s[0] + s[1] + s[2] + s[3]);
     }
 }
@@ -352,7 +358,7 @@ static float gemv_row_q1(const block_q1_0 * a, const block_q8_0 * y,
     float sumf = 0.0f;
     for (int64_t b = 0; b < kb; b++) {
         const float dA = fp16_to_fp32(a[b].d);
-        vuc raw = vec_xl(0, (const unsigned char *)a[b].qs);
+        vuc raw = load16u((const uint8_t *)(a[b].qs) + (0));
         for (int c = 0; c < 4; c++) {
             const vuc off = vec_splats((unsigned char)(4*c));
             vuc e0 = vec_perm(raw, raw, vec_add(rep0, off));
@@ -360,8 +366,8 @@ static float gemv_row_q1(const block_q1_0 * a, const block_q8_0 * y,
             vuc m0 = (vuc)vec_cmpeq(vec_and(e0, bitsel), bitsel);
             vuc m1 = (vuc)vec_cmpeq(vec_and(e1, bitsel), bitsel);
             const int8_t * q = y[4*b + c].qs;
-            vuc y0 = vec_xl(0,  (const unsigned char *)q);
-            vuc y1 = vec_xl(16, (const unsigned char *)q);
+            vuc y0 = load16u((const uint8_t *)(q) + (0));
+            vuc y1 = load16u((const uint8_t *)(q) + (16));
             vsi z = vec_splats(0);
             vsi p = vec_sum4s((vsc)vec_and(y0, m0), z);
             p = vec_sum4s((vsc)vec_and(y1, m1), p);
@@ -381,8 +387,8 @@ static float gemv_row_q2(const block_q2_0 * a, const block_q8_0 * y,
     float sumf = 0.0f;
     for (int64_t b = 0; b < kb; b++) {
         const float dA = fp16_to_fp32(a[b].d);
-        vuc lo = vec_xl(0,  (const unsigned char *)a[b].qs);
-        vuc hi = vec_xl(16, (const unsigned char *)a[b].qs);
+        vuc lo = load16u((const uint8_t *)(a[b].qs) + (0));
+        vuc hi = load16u((const uint8_t *)(a[b].qs) + (16));
         for (int c = 0; c < 4; c++) {
             const vuc off = vec_splats((unsigned char)(8*c));
             vuc e0 = vec_perm(lo, hi, vec_add(rep0, off));
@@ -392,8 +398,8 @@ static float gemv_row_q2(const block_q2_0 * a, const block_q8_0 * y,
             vuc ma1 = (vuc)vec_cmpeq(vec_and(e1, sel0), sel0);
             vuc mb1 = (vuc)vec_cmpeq(vec_and(e1, sel1), sel1);
             const int8_t * q = y[4*b + c].qs;
-            vuc y0 = vec_xl(0,  (const unsigned char *)q);
-            vuc y1 = vec_xl(16, (const unsigned char *)q);
+            vuc y0 = load16u((const uint8_t *)(q) + (0));
+            vuc y1 = load16u((const uint8_t *)(q) + (16));
             vsi z = vec_splats(0);
             vsi p0 = vec_sum4s((vsc)vec_and(y0, ma0), z);
             p0 = vec_sum4s((vsc)vec_and(y1, ma1), p0);
