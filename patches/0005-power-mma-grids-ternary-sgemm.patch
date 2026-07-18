@@ -1,0 +1,1253 @@
+diff --git a/ggml/src/ggml-cpu/CMakeLists.txt b/ggml/src/ggml-cpu/CMakeLists.txt
+index 999c9be..c86341d 100644
+--- a/ggml/src/ggml-cpu/CMakeLists.txt
++++ b/ggml/src/ggml-cpu/CMakeLists.txt
+@@ -90,6 +90,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+                     ggml-cpu/llamafile/q3k_ppc_mma.cpp
+                     ggml-cpu/llamafile/iq4_ppc_mma.cpp
+                     ggml-cpu/llamafile/legacy_ppc_mma.cpp
++                    ggml-cpu/llamafile/iq_grid_ppc_mma.cpp
++                    ggml-cpu/llamafile/iq_grids_ppc.h
+                     ggml-cpu/llamafile/kquants_ppc_mma.h
+                     ggml-cpu/llamafile/qbit_ppc_mma.h
+                     ggml-cpu/llamafile/sgemm.h)
+diff --git a/ggml/src/ggml-cpu/llamafile/iq_grid_ppc_mma.cpp b/ggml/src/ggml-cpu/llamafile/iq_grid_ppc_mma.cpp
+new file mode 100644
+index 0000000..851b44f
+--- /dev/null
++++ b/ggml/src/ggml-cpu/llamafile/iq_grid_ppc_mma.cpp
+@@ -0,0 +1,415 @@
++// iq_grid_ppc_mma.cpp - imported from github.com/mavin2009/ppc-mma-kernels
++// (standalone-verified under qemu -cpu power10). Grid-codebook and
++// ternary formats on POWER10/POWER11 MMA via decode-at-repack + the
++// shared signed 8x8 kernel. Uses a local copy of the grid tables
++// (iq_grids_ppc.h) to avoid depending on GGML_COMMON_IMPL linkage.
++
++#include "ggml-impl.h"
++#include "ggml-cpu-impl.h"
++#include "kquants_ppc_mma.h"
++
++#include <altivec.h>
++#include <cassert>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include "iq_grids_ppc.h"
++
++#define QK_K 256
++#define IQ1S_DELTA 0.125f
++
++typedef uint16_t ppc_half;
++
++typedef struct { uint8_t qs[(QK_K - 4*QK_K/64)/5]; uint8_t qh[QK_K/64]; ppc_half d; } block_tq1_0_ppc;
++typedef struct { uint8_t qs[QK_K/4]; ppc_half d; } block_tq2_0_ppc;
++typedef struct { ppc_half d; uint16_t qs[QK_K/8]; } block_iq2_xxs_ppc;
++typedef struct { ppc_half d; uint8_t qs[3*QK_K/8]; } block_iq3_xxs_ppc;
++typedef struct { ppc_half d; uint8_t qs[QK_K/4]; uint8_t qh[QK_K/32];
++                 uint8_t signs[QK_K/8]; uint8_t scales[QK_K/64]; } block_iq3_s_ppc;
++typedef struct { ppc_half d; uint8_t qs[QK_K/8]; uint16_t qh[QK_K/32]; } block_iq1_s_ppc;
++typedef struct { float d; int8_t qs[QK_K]; int16_t bsums[QK_K/16]; } block_q8_K_ppc;
++
++static_assert(sizeof(block_tq1_0_ppc)   == 2 + 4 + 48, "bad tq1_0");
++static_assert(sizeof(block_tq2_0_ppc)   == 2 + 64, "bad tq2_0");
++static_assert(sizeof(block_iq2_xxs_ppc) == 2 + QK_K/4, "bad iq2_xxs");
++static_assert(sizeof(block_iq3_xxs_ppc) == 2 + 3*QK_K/8, "bad iq3_xxs");
++static_assert(sizeof(block_iq3_s_ppc)   == 2 + 13*(QK_K/32) + QK_K/64, "bad iq3_s");
++static_assert(sizeof(block_iq1_s_ppc)   == 2 + QK_K/8 + QK_K/16, "bad iq1_s");
++
++static inline float fp16_to_fp32(ppc_half h) {
++    const uint32_t sign = (uint32_t)(h >> 15) << 31;
++    uint32_t exp  = (h >> 10) & 0x1f;
++    uint32_t mant = h & 0x3ff;
++    uint32_t bits;
++    if (exp == 0) {
++        if (mant == 0) bits = sign;
++        else {
++            exp = 127 - 15 + 1;
++            while (!(mant & 0x400)) { mant <<= 1; exp--; }
++            mant &= 0x3ff;
++            bits = sign | (exp << 23) | (mant << 13);
++        }
++    } else if (exp == 0x1f) bits = sign | 0x7f800000u | (mant << 13);
++    else bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
++    float f; memcpy(&f, &bits, 4);
++    return f;
++}
++
++// ---- scalar decoders: superblock -> 256 signed int8 codes + 8 scales ----
++// (one per 32-chunk).  Direct ports of dequantize_row semantics.
++
++static void dec_tq2_0(const block_tq2_0_ppc * b, int8_t code[QK_K], float sc[8]) {
++    const float d = fp16_to_fp32(b->d);
++    int8_t * y = code;
++    for (size_t j = 0; j < sizeof(b->qs); j += 32)
++        for (size_t l = 0; l < 4; ++l)
++            for (size_t m = 0; m < 32; ++m)
++                *y++ = (int8_t)(((b->qs[j + m] >> (l*2)) & 3) - 1);
++    for (int c = 0; c < 8; c++) sc[c] = d;
++}
++
++static void dec_tq1_0(const block_tq1_0_ppc * b, int8_t code[QK_K], float sc[8]) {
++    static const uint8_t pow3[6] = { 1, 3, 9, 27, 81, 243 };
++    const float d = fp16_to_fp32(b->d);
++    int8_t * y = code;
++    for (size_t j = 0; j < sizeof(b->qs) - sizeof(b->qs) % 32; j += 32)
++        for (size_t n = 0; n < 5; ++n)
++            for (size_t m = 0; m < 32; ++m) {
++                uint8_t q = (uint8_t)(b->qs[j + m] * pow3[n]);
++                *y++ = (int8_t)((((uint16_t)q * 3) >> 8) - 1);
++            }
++    for (size_t j = sizeof(b->qs) - sizeof(b->qs) % 32; j < sizeof(b->qs); j += 16)
++        for (size_t n = 0; n < 5; ++n)
++            for (size_t m = 0; m < 16; ++m) {
++                uint8_t q = (uint8_t)(b->qs[j + m] * pow3[n]);
++                *y++ = (int8_t)((((uint16_t)q * 3) >> 8) - 1);
++            }
++    for (size_t n = 0; n < 4; ++n)
++        for (size_t j = 0; j < sizeof(b->qh); ++j) {
++            uint8_t q = (uint8_t)(b->qh[j] * pow3[n]);
++            *y++ = (int8_t)((((uint16_t)q * 3) >> 8) - 1);
++        }
++    for (int c = 0; c < 8; c++) sc[c] = d;
++}
++
++static void dec_iq2_xxs(const block_iq2_xxs_ppc * b, int8_t code[QK_K], float sc[8]) {
++    const float d = fp16_to_fp32(b->d);
++    uint32_t aux32[2];
++    const uint8_t * aux8 = (const uint8_t *)aux32;
++    for (int ib32 = 0; ib32 < 8; ++ib32) {
++        memcpy(aux32, b->qs + 4*ib32, 8);
++        sc[ib32] = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
++        int8_t * y = code + 32*ib32;
++        for (int l = 0; l < 4; ++l) {
++            const uint8_t * grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
++            const uint8_t signs = ksigns_iq2xs[(aux32[1] >> 7*l) & 127];
++            for (int j = 0; j < 8; ++j)
++                y[8*l + j] = (int8_t)((signs & kmask_iq2xs[j]) ? -(int)grid[j] : (int)grid[j]);
++        }
++    }
++}
++
++static void dec_iq3_xxs(const block_iq3_xxs_ppc * b, int8_t code[QK_K], float sc[8]) {
++    const float d = fp16_to_fp32(b->d);
++    const uint8_t * qs = b->qs;
++    const uint8_t * sas = b->qs + QK_K/4;
++    uint32_t aux32;
++    for (int ib32 = 0; ib32 < 8; ++ib32) {
++        memcpy(&aux32, sas + 4*ib32, 4);
++        sc[ib32] = d * (0.5f + (aux32 >> 28)) * 0.5f;
++        int8_t * y = code + 32*ib32;
++        for (int l = 0; l < 4; ++l) {
++            const uint8_t signs = ksigns_iq2xs[(aux32 >> 7*l) & 127];
++            const uint8_t * g1 = (const uint8_t *)(iq3xxs_grid + qs[8*ib32 + 2*l + 0]);
++            const uint8_t * g2 = (const uint8_t *)(iq3xxs_grid + qs[8*ib32 + 2*l + 1]);
++            for (int j = 0; j < 4; ++j) {
++                y[8*l + j + 0] = (int8_t)((signs & kmask_iq2xs[j+0]) ? -(int)g1[j] : (int)g1[j]);
++                y[8*l + j + 4] = (int8_t)((signs & kmask_iq2xs[j+4]) ? -(int)g2[j] : (int)g2[j]);
++            }
++        }
++    }
++}
++
++static void dec_iq3_s(const block_iq3_s_ppc * b, int8_t code[QK_K], float sc[8]) {
++    const float d = fp16_to_fp32(b->d);
++    const uint8_t * qs = b->qs;
++    const uint8_t * qh = b->qh;
++    const uint8_t * signs = b->signs;
++    for (int ib32 = 0; ib32 < 8; ib32 += 2) {
++        sc[ib32 + 0] = d * (1 + 2*(b->scales[ib32/2] & 0xF));
++        sc[ib32 + 1] = d * (1 + 2*(b->scales[ib32/2] >>  4));
++        for (int half = 0; half < 2; half++) {
++            int8_t * y = code + 32*(ib32 + half);
++            for (int l = 0; l < 4; ++l) {
++                const uint8_t * g1 = (const uint8_t *)(iq3s_grid + (qs[2*l+0] | ((qh[half] << (8-2*l)) & 256)));
++                const uint8_t * g2 = (const uint8_t *)(iq3s_grid + (qs[2*l+1] | ((qh[half] << (7-2*l)) & 256)));
++                for (int j = 0; j < 4; ++j) {
++                    y[8*l + j + 0] = (int8_t)((signs[l] & kmask_iq2xs[j+0]) ? -(int)g1[j] : (int)g1[j]);
++                    y[8*l + j + 4] = (int8_t)((signs[l] & kmask_iq2xs[j+4]) ? -(int)g2[j] : (int)g2[j]);
++                }
++            }
++            qs += 8; signs += 4;
++        }
++        qh += 2;
++    }
++}
++
++// IQ1_S: value = dl*(g + delta), g in {-1,+1}, delta = +/-1/8 per 32.
++// Exact integer form: code = 8*g + (delta<0 ? -1 : +1), scale = dl/8.
++static void dec_iq1_s(const block_iq1_s_ppc * b, int8_t code[QK_K], float sc[8]) {
++    const float d = fp16_to_fp32(b->d);
++    const uint8_t * qs = b->qs;
++    for (int ib = 0; ib < 8; ++ib) {
++        const float dl = d * (2*((b->qh[ib] >> 12) & 7) + 1);
++        sc[ib] = dl * 0.125f;
++        const int dsign = (b->qh[ib] & 0x8000) ? -1 : +1;
++        int8_t * y = code + 32*ib;
++        for (int l = 0; l < 4; ++l) {
++            const int8_t * grid = (const int8_t *)(iq1s_grid + (qs[l] | (((b->qh[ib] >> 3*l) & 7) << 8)));
++            for (int j = 0; j < 8; ++j)
++                y[8*l + j] = (int8_t)(8*grid[j] + dsign);
++        }
++        qs += 4;
++    }
++}
++
++#if defined(__MMA__) && defined(__powerpc64__)
++
++typedef vector unsigned char  vuc;
++typedef vector signed char    vsc;
++typedef vector unsigned int   vui;
++typedef vector signed int     vsi;
++typedef vector float          vfl;
++
++#define KC_ELEMS  2048
++#define KC_CH     (KC_ELEMS / 32)
++#define MR        8
++#define NR        8
++
++typedef struct {
++    vuc v[KC_CH][16];
++    vfl sA  [KC_CH][2];
++    vfl C128[KC_CH][2];
++} agrid_t;
++
++typedef struct {
++    vuc v[KC_CH][16];
++    vfl dB[KC_CH][2];
++} bgrid_t;
++
++static inline void mma_transpose4(const vui rows[4], vuc * out, int stride) {
++    vui t0 = vec_mergeh(rows[0], rows[1]);
++    vui t1 = vec_mergel(rows[0], rows[1]);
++    vui t2 = vec_mergeh(rows[2], rows[3]);
++    vui t3 = vec_mergel(rows[2], rows[3]);
++    out[0*stride] = (vuc)vec_xxpermdi(t0, t2, 0);
++    out[1*stride] = (vuc)vec_xxpermdi(t0, t2, 3);
++    out[2*stride] = (vuc)vec_xxpermdi(t1, t3, 0);
++    out[3*stride] = (vuc)vec_xxpermdi(t1, t3, 3);
++}
++
++static inline int hsum(vsi s) { return s[0] + s[1] + s[2] + s[3]; }
++
++static void grid_place_chunk(agrid_t * T, int64_t ch,
++                             const vsc w[MR][2], const float scale[MR]) {
++    for (int g = 0; g < 2; g++) {
++        float W[4];
++        vui rows4[4];
++        for (int h = 0; h < 2; h++) {
++            for (int r = 0; r < 4; r++) rows4[r] = (vui)w[4*g + r][h];
++            mma_transpose4(rows4, &T->v[ch][8*h + g], 2);
++        }
++        for (int r = 0; r < 4; r++) {
++            vsi z = vec_splats(0);
++            vsi s = vec_sum4s(w[4*g + r][0], z);
++            s = vec_sum4s(w[4*g + r][1], s);
++            W[r] = (float)hsum(s);
++        }
++        T->sA  [ch][g] = (vfl){ scale[4*g], scale[4*g+1], scale[4*g+2], scale[4*g+3] };
++        T->C128[ch][g] = (vfl){ 128.0f*W[0]*scale[4*g],   128.0f*W[1]*scale[4*g+1],
++                                128.0f*W[2]*scale[4*g+2], 128.0f*W[3]*scale[4*g+3] };
++    }
++}
++
++static inline int64_t rt(int64_t m) { return (m + MR - 1) / MR; }
++static inline int64_t ct(int64_t n) { return (n + NR - 1) / NR; }
++static inline int64_t sl(int64_t k) { return (k/32 + KC_CH - 1) / KC_CH; }
++
++extern "C" size_t grid_apack_size(int64_t m, int64_t k) {
++    return (size_t)(rt(m) * sl(k)) * sizeof(agrid_t);
++}
++extern "C" size_t grid_bpack_size(int64_t n, int64_t k) {
++    return (size_t)(ct(n) * sl(k)) * sizeof(bgrid_t);
++}
++
++// generic repack over any superblock decoder
++template <typename BLK, void (*DEC)(const BLK *, int8_t[QK_K], float[8])>
++static void repack_grid(const BLK * A, int64_t lda, int64_t m, int64_t k, agrid_t * P) {
++    const int64_t nsb = k/QK_K, ns = sl(k);
++    for (int64_t it = 0; it < rt(m); it++)
++    for (int64_t s = 0; s < ns; s++) {
++        agrid_t * T = &P[it*ns + s];
++        const int64_t sb0 = (s*KC_CH)/8;
++        const int64_t nsl = (nsb - sb0) < KC_CH/8 ? (nsb - sb0) : KC_CH/8;
++        for (int64_t sb = 0; sb < nsl; sb++) {
++            int8_t code[MR][QK_K]; float sc[MR][8];
++            for (int r = 0; r < MR; r++) {
++                int64_t rr = it*MR + r; if (rr >= m) rr = m - 1;
++                DEC(&A[rr*lda + sb0 + sb], code[r], sc[r]);
++            }
++            for (int c = 0; c < 8; c++) {
++                vsc w[MR][2]; float scale[MR];
++                for (int r = 0; r < MR; r++) {
++                    memcpy(&w[r][0], code[r] + 32*c,      16);
++                    memcpy(&w[r][1], code[r] + 32*c + 16, 16);
++                    scale[r] = sc[r][c];
++                }
++                grid_place_chunk(T, 8*sb + c, w, scale);
++            }
++        }
++    }
++}
++
++extern "C" void grid_repack_tq2_0(const block_tq2_0_ppc * A, int64_t lda, int64_t m, int64_t k, void * p) {
++    repack_grid<block_tq2_0_ppc, dec_tq2_0>(A, lda, m, k, (agrid_t *)p); }
++extern "C" void grid_repack_tq1_0(const block_tq1_0_ppc * A, int64_t lda, int64_t m, int64_t k, void * p) {
++    repack_grid<block_tq1_0_ppc, dec_tq1_0>(A, lda, m, k, (agrid_t *)p); }
++extern "C" void grid_repack_iq2_xxs(const block_iq2_xxs_ppc * A, int64_t lda, int64_t m, int64_t k, void * p) {
++    repack_grid<block_iq2_xxs_ppc, dec_iq2_xxs>(A, lda, m, k, (agrid_t *)p); }
++extern "C" void grid_repack_iq3_xxs(const block_iq3_xxs_ppc * A, int64_t lda, int64_t m, int64_t k, void * p) {
++    repack_grid<block_iq3_xxs_ppc, dec_iq3_xxs>(A, lda, m, k, (agrid_t *)p); }
++extern "C" void grid_repack_iq3_s(const block_iq3_s_ppc * A, int64_t lda, int64_t m, int64_t k, void * p) {
++    repack_grid<block_iq3_s_ppc, dec_iq3_s>(A, lda, m, k, (agrid_t *)p); }
++extern "C" void grid_repack_iq1_s(const block_iq1_s_ppc * A, int64_t lda, int64_t m, int64_t k, void * p) {
++    repack_grid<block_iq1_s_ppc, dec_iq1_s>(A, lda, m, k, (agrid_t *)p); }
++
++extern "C" void grid_pack_b_q8_K(const block_q8_K_ppc * B, int64_t ldb,
++                                 int64_t n, int64_t k, void * packed) {
++    bgrid_t * P = (bgrid_t *)packed;
++    const int64_t nsb = k/QK_K, ns = sl(k);
++    const vuc flip = vec_splats((unsigned char)0x80);
++    for (int64_t jt = 0; jt < ct(n); jt++)
++    for (int64_t s = 0; s < ns; s++) {
++        bgrid_t * T = &P[jt*ns + s];
++        const int64_t sb0 = (s*KC_CH)/8;
++        const int64_t nsl = (nsb - sb0) < KC_CH/8 ? (nsb - sb0) : KC_CH/8;
++        for (int64_t sb = 0; sb < nsl; sb++) {
++            const block_q8_K_ppc * yb[NR]; float dB[NR];
++            for (int j = 0; j < NR; j++) {
++                int64_t jj = jt*NR + j; if (jj >= n) jj = n - 1;
++                yb[j] = &B[jj*ldb + sb0 + sb];
++                dB[j] = yb[j]->d;
++            }
++            for (int ib = 0; ib < 8; ib++) {
++                const int64_t ch = 8*sb + ib;
++                T->dB[ch][0] = (vfl){ dB[0], dB[1], dB[2], dB[3] };
++                T->dB[ch][1] = (vfl){ dB[4], dB[5], dB[6], dB[7] };
++                vui rows4[4];
++                for (int a = 0; a < 2; a++)
++                    for (int h = 0; h < 2; h++) {
++                        for (int j = 0; j < 4; j++)
++                            rows4[j] = (vui)vec_xor(
++                                vec_xl(32*ib + 16*h, (const unsigned char *)yb[4*a + j]->qs), flip);
++                        mma_transpose4(rows4, &T->v[ch][8*h + a], 2);
++                    }
++            }
++        }
++    }
++}
++
++static void kernel_grid_8x8(const agrid_t * PA, const bgrid_t * PB,
++                            int64_t nch, vfl fin[MR][2]) {
++    for (int64_t ch = 0; ch < nch; ch++) {
++        const vuc * a = PA->v[ch];
++        const vuc * y = PB->v[ch];
++        if (ch + 1 < nch) {
++            __builtin_prefetch(PA->v[ch + 1], 0, 3);
++            __builtin_prefetch(PB->v[ch + 1], 0, 3);
++        }
++        __vector_quad acc[2][2];
++        for (int g = 0; g < 2; g++)
++            for (int cgi = 0; cgi < 2; cgi++)
++                __builtin_mma_xxsetaccz(&acc[g][cgi]);
++        for (int x = 0; x < 8; x++) {
++            const vuc w0 = a[2*x], w1 = a[2*x + 1];
++            const vuc y0 = y[2*x], y1 = y[2*x + 1];
++            __builtin_mma_xvi8ger4pp(&acc[0][0], w0, y0);
++            __builtin_mma_xvi8ger4pp(&acc[0][1], w0, y1);
++            __builtin_mma_xvi8ger4pp(&acc[1][0], w1, y0);
++            __builtin_mma_xvi8ger4pp(&acc[1][1], w1, y1);
++        }
++        for (int g = 0; g < 2; g++) {
++            const vfl sA   = PA->sA  [ch][g];
++            const vfl C128 = PA->C128[ch][g];
++            for (int cgi = 0; cgi < 2; cgi++) {
++                vsi rowsP[4];
++                __builtin_mma_disassemble_acc(rowsP, &acc[g][cgi]);
++                const vfl dB = PB->dB[ch][cgi];
++                for (int r = 0; r < 4; r++) {
++                    vfl t = vec_msub(vec_ctf(rowsP[r],0),
++                                     vec_splats(sA[r]), vec_splats(C128[r]));
++                    fin[4*g + r][cgi] = vec_madd(t, dB, fin[4*g + r][cgi]);
++                }
++            }
++        }
++    }
++}
++
++extern "C" void grid_gemm_packed(int64_t m, int64_t n, int64_t k,
++                                 const void * packedA, const void * packedB,
++                                 float * C, int64_t ldc, int ith, int nth) {
++    const agrid_t * PA = (const agrid_t *)packedA;
++    const bgrid_t * PB = (const bgrid_t *)packedB;
++    const int64_t kb = k/32, ns = sl(k), mt = rt(m), njt = ct(n);
++    const int64_t tpt = (mt + nth - 1) / nth;
++    const int64_t t0 = ith*tpt, t1 = (ith+1)*tpt < mt ? (ith+1)*tpt : mt;
++    vfl fin[MR][2];
++    for (int64_t it = t0; it < t1; it++) {
++        const int64_t i = it*MR;
++        const int64_t rows = (m - i) < MR ? (m - i) : MR;
++        for (int64_t jt = 0; jt < njt; jt++) {
++            for (int r = 0; r < MR; r++) fin[r][0] = fin[r][1] = vec_splats(0.0f);
++            for (int64_t s = 0; s < ns; s++) {
++                const int64_t b0 = s*KC_CH;
++                const int64_t nch = (kb - b0) < KC_CH ? (kb - b0) : KC_CH;
++                kernel_grid_8x8(&PA[it*ns + s], &PB[jt*ns + s], nch, fin);
++            }
++            const int64_t j0 = jt*NR;
++            const int64_t cols = (n - j0) < NR ? (n - j0) : NR;
++            for (int64_t r = 0; r < rows; r++)
++                for (int64_t cj = 0; cj < cols; cj++)
++                    C[(i + r) + (j0 + cj)*ldc] = fin[r][cj >> 2][cj & 3];
++        }
++    }
++}
++
++
++#define GRID_ONESHOT(NAME, BLKA, REPACK)                                       \
++extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
++        const void * Av, int64_t lda, const void * Bv, int64_t ldb,            \
++        float * C, int64_t ldc, int ith, int nth) {                            \
++    const BLKA * A = (const BLKA *)Av;                                         \
++    const block_q8_K_ppc * B = (const block_q8_K_ppc *)Bv;                     \
++    void * PA = aligned_alloc(64, grid_apack_size(MR, k));                     \
++    void * PB = aligned_alloc(64, grid_bpack_size(n, k));                      \
++    if (!PA || !PB) { free(PA); free(PB); return; }                            \
++    grid_pack_b_q8_K(B, ldb, n, k, PB);                                        \
++    const int64_t mt = (m + MR - 1) / MR;                                      \
++    const int64_t tpt = (mt + nth - 1) / nth;                                  \
++    for (int64_t it = ith*tpt; it < (ith+1)*tpt && it < mt; it++) {            \
++        const int64_t i = it*MR;                                               \
++        const int64_t rows = (m - i) < MR ? (m - i) : MR;                      \
++        REPACK(A + i*lda, lda, rows, k, PA);                                   \
++        grid_gemm_packed(rows, n, k, PA, PB, C + i, ldc, 0, 1);                \
++    }                                                                          \
++    free(PA); free(PB);                                                        \
++}
++GRID_ONESHOT(gemm_tq2_0_q8_K_ppc,   block_tq2_0_ppc,   grid_repack_tq2_0)
++GRID_ONESHOT(gemm_tq1_0_q8_K_ppc,   block_tq1_0_ppc,   grid_repack_tq1_0)
++GRID_ONESHOT(gemm_iq2_xxs_q8_K_ppc, block_iq2_xxs_ppc, grid_repack_iq2_xxs)
++GRID_ONESHOT(gemm_iq3_xxs_q8_K_ppc, block_iq3_xxs_ppc, grid_repack_iq3_xxs)
++GRID_ONESHOT(gemm_iq3_s_q8_K_ppc,   block_iq3_s_ppc,   grid_repack_iq3_s)
++GRID_ONESHOT(gemm_iq1_s_q8_K_ppc,   block_iq1_s_ppc,   grid_repack_iq1_s)
++
++#endif // __MMA__
++
+diff --git a/ggml/src/ggml-cpu/llamafile/iq_grids_ppc.h b/ggml/src/ggml-cpu/llamafile/iq_grids_ppc.h
+new file mode 100644
+index 0000000..4797197
+--- /dev/null
++++ b/ggml/src/ggml-cpu/llamafile/iq_grids_ppc.h
+@@ -0,0 +1,701 @@
++// iq_grids.h - grid/sign tables extracted from ggml-common.h (MIT, ggml authors)
++#pragma once
++#include <stdint.h>
++
++static const uint64_t iq2xxs_grid[256] = {
++    0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
++    0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
++    0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
++    0x0808080819081908, 0x0808080819190808, 0x0808080819192b08, 0x08080808192b0819,
++    0x08080808192b1908, 0x080808082b080808, 0x080808082b08082b, 0x080808082b082b2b,
++    0x080808082b2b082b, 0x0808081908080819, 0x0808081908081908, 0x0808081908190808,
++    0x0808081908191919, 0x0808081919080808, 0x080808192b081908, 0x080808192b192b08,
++    0x0808082b08080808, 0x0808082b0808082b, 0x0808082b082b082b, 0x0808082b2b08082b,
++    0x0808190808080819, 0x0808190808081908, 0x0808190808190808, 0x08081908082b0819,
++    0x08081908082b1908, 0x0808190819080808, 0x080819081908082b, 0x0808190819082b08,
++    0x08081908192b0808, 0x080819082b080819, 0x080819082b081908, 0x080819082b190808,
++    0x080819082b2b1908, 0x0808191908080808, 0x080819190808082b, 0x0808191908082b08,
++    0x08081919082b0808, 0x080819191908192b, 0x08081919192b2b19, 0x080819192b080808,
++    0x080819192b190819, 0x0808192b08082b19, 0x0808192b08190808, 0x0808192b19080808,
++    0x0808192b2b081908, 0x0808192b2b2b1908, 0x08082b0808080808, 0x08082b0808081919,
++    0x08082b0808082b08, 0x08082b0808191908, 0x08082b08082b2b08, 0x08082b0819080819,
++    0x08082b0819081908, 0x08082b0819190808, 0x08082b081919082b, 0x08082b082b082b08,
++    0x08082b1908081908, 0x08082b1919080808, 0x08082b2b0808082b, 0x08082b2b08191908,
++    0x0819080808080819, 0x0819080808081908, 0x0819080808190808, 0x08190808082b0819,
++    0x0819080819080808, 0x08190808192b0808, 0x081908082b081908, 0x081908082b190808,
++    0x081908082b191919, 0x0819081908080808, 0x0819081908082b08, 0x08190819082b0808,
++    0x0819081919190808, 0x0819081919192b2b, 0x081908192b080808, 0x0819082b082b1908,
++    0x0819082b19081919, 0x0819190808080808, 0x0819190808082b08, 0x08191908082b0808,
++    0x08191908082b1919, 0x0819190819082b19, 0x081919082b080808, 0x0819191908192b08,
++    0x08191919192b082b, 0x0819192b08080808, 0x0819192b0819192b, 0x08192b0808080819,
++    0x08192b0808081908, 0x08192b0808190808, 0x08192b0819080808, 0x08192b082b080819,
++    0x08192b1908080808, 0x08192b1908081919, 0x08192b192b2b0808, 0x08192b2b19190819,
++    0x082b080808080808, 0x082b08080808082b, 0x082b080808082b2b, 0x082b080819081908,
++    0x082b0808192b0819, 0x082b08082b080808, 0x082b08082b08082b, 0x082b0819082b2b19,
++    0x082b081919082b08, 0x082b082b08080808, 0x082b082b0808082b, 0x082b190808080819,
++    0x082b190808081908, 0x082b190808190808, 0x082b190819080808, 0x082b19081919192b,
++    0x082b191908080808, 0x082b191919080819, 0x082b1919192b1908, 0x082b192b2b190808,
++    0x082b2b0808082b08, 0x082b2b08082b0808, 0x082b2b082b191908, 0x082b2b2b19081908,
++    0x1908080808080819, 0x1908080808081908, 0x1908080808190808, 0x1908080808192b08,
++    0x19080808082b0819, 0x19080808082b1908, 0x1908080819080808, 0x1908080819082b08,
++    0x190808081919192b, 0x19080808192b0808, 0x190808082b080819, 0x190808082b081908,
++    0x190808082b190808, 0x1908081908080808, 0x19080819082b0808, 0x19080819192b0819,
++    0x190808192b080808, 0x190808192b081919, 0x1908082b08080819, 0x1908082b08190808,
++    0x1908082b19082b08, 0x1908082b1919192b, 0x1908082b192b2b08, 0x1908190808080808,
++    0x1908190808082b08, 0x19081908082b0808, 0x190819082b080808, 0x190819082b192b19,
++    0x190819190819082b, 0x19081919082b1908, 0x1908192b08080808, 0x19082b0808080819,
++    0x19082b0808081908, 0x19082b0808190808, 0x19082b0819080808, 0x19082b0819081919,
++    0x19082b1908080808, 0x19082b1919192b08, 0x19082b19192b0819, 0x19082b192b08082b,
++    0x19082b2b19081919, 0x19082b2b2b190808, 0x1919080808080808, 0x1919080808082b08,
++    0x1919080808190819, 0x1919080808192b19, 0x19190808082b0808, 0x191908082b080808,
++    0x191908082b082b08, 0x1919081908081908, 0x191908191908082b, 0x191908192b2b1908,
++    0x1919082b2b190819, 0x191919082b190808, 0x191919082b19082b, 0x1919191908082b2b,
++    0x1919192b08080819, 0x1919192b19191908, 0x19192b0808080808, 0x19192b0808190819,
++    0x19192b0808192b19, 0x19192b08192b1908, 0x19192b1919080808, 0x19192b2b08082b08,
++    0x192b080808081908, 0x192b080808190808, 0x192b080819080808, 0x192b0808192b2b08,
++    0x192b081908080808, 0x192b081919191919, 0x192b082b08192b08, 0x192b082b192b0808,
++    0x192b190808080808, 0x192b190808081919, 0x192b191908190808, 0x192b19190819082b,
++    0x192b19192b081908, 0x192b2b081908082b, 0x2b08080808080808, 0x2b0808080808082b,
++    0x2b08080808082b2b, 0x2b08080819080819, 0x2b0808082b08082b, 0x2b08081908081908,
++    0x2b08081908192b08, 0x2b08081919080808, 0x2b08082b08190819, 0x2b08190808080819,
++    0x2b08190808081908, 0x2b08190808190808, 0x2b08190808191919, 0x2b08190819080808,
++    0x2b081908192b0808, 0x2b08191908080808, 0x2b0819191908192b, 0x2b0819192b191908,
++    0x2b08192b08082b19, 0x2b08192b19080808, 0x2b08192b192b0808, 0x2b082b080808082b,
++    0x2b082b1908081908, 0x2b082b2b08190819, 0x2b19080808081908, 0x2b19080808190808,
++    0x2b190808082b1908, 0x2b19080819080808, 0x2b1908082b2b0819, 0x2b1908190819192b,
++    0x2b1908192b080808, 0x2b19082b19081919, 0x2b19190808080808, 0x2b191908082b082b,
++    0x2b19190819081908, 0x2b19191919190819, 0x2b192b082b080819, 0x2b192b19082b0808,
++    0x2b2b08080808082b, 0x2b2b080819190808, 0x2b2b08082b081919, 0x2b2b081908082b19,
++    0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
++};
++
++static const uint32_t iq3xxs_grid[256] = {
++    0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
++    0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
++    0x040c140c, 0x040c142c, 0x040c1c04, 0x040c1c14, 0x040c240c, 0x040c2c24, 0x040c3e04, 0x04140404,
++    0x04140414, 0x04140424, 0x04140c0c, 0x04141404, 0x04141414, 0x04141c0c, 0x04141c1c, 0x04141c3e,
++    0x04142c0c, 0x04142c3e, 0x04143e2c, 0x041c040c, 0x041c043e, 0x041c0c04, 0x041c0c14, 0x041c142c,
++    0x041c3e04, 0x04240c1c, 0x04241c3e, 0x04242424, 0x04242c3e, 0x04243e1c, 0x04243e2c, 0x042c040c,
++    0x042c043e, 0x042c1c14, 0x042c2c14, 0x04341c2c, 0x04343424, 0x043e0c04, 0x043e0c24, 0x043e0c34,
++    0x043e241c, 0x043e340c, 0x0c04040c, 0x0c04041c, 0x0c040c04, 0x0c040c14, 0x0c04140c, 0x0c04141c,
++    0x0c041c04, 0x0c041c14, 0x0c041c24, 0x0c04243e, 0x0c042c04, 0x0c0c0404, 0x0c0c0414, 0x0c0c0c0c,
++    0x0c0c1404, 0x0c0c1414, 0x0c14040c, 0x0c14041c, 0x0c140c04, 0x0c140c14, 0x0c14140c, 0x0c141c04,
++    0x0c143e14, 0x0c1c0404, 0x0c1c0414, 0x0c1c1404, 0x0c1c1c0c, 0x0c1c2434, 0x0c1c3434, 0x0c24040c,
++    0x0c24042c, 0x0c242c04, 0x0c2c1404, 0x0c2c1424, 0x0c2c2434, 0x0c2c3e0c, 0x0c34042c, 0x0c3e1414,
++    0x0c3e2404, 0x14040404, 0x14040414, 0x14040c0c, 0x14040c1c, 0x14041404, 0x14041414, 0x14041434,
++    0x14041c0c, 0x14042414, 0x140c040c, 0x140c041c, 0x140c042c, 0x140c0c04, 0x140c0c14, 0x140c140c,
++    0x140c1c04, 0x140c341c, 0x140c343e, 0x140c3e04, 0x14140404, 0x14140414, 0x14140c0c, 0x14140c3e,
++    0x14141404, 0x14141414, 0x14141c3e, 0x14142404, 0x14142c2c, 0x141c040c, 0x141c0c04, 0x141c0c24,
++    0x141c3e04, 0x141c3e24, 0x14241c2c, 0x14242c1c, 0x142c041c, 0x142c143e, 0x142c240c, 0x142c3e24,
++    0x143e040c, 0x143e041c, 0x143e0c34, 0x143e242c, 0x1c04040c, 0x1c040c04, 0x1c040c14, 0x1c04140c,
++    0x1c04141c, 0x1c042c04, 0x1c04342c, 0x1c043e14, 0x1c0c0404, 0x1c0c0414, 0x1c0c1404, 0x1c0c1c0c,
++    0x1c0c2424, 0x1c0c2434, 0x1c14040c, 0x1c14041c, 0x1c140c04, 0x1c14142c, 0x1c142c14, 0x1c143e14,
++    0x1c1c0c0c, 0x1c1c1c1c, 0x1c241c04, 0x1c24243e, 0x1c243e14, 0x1c2c0404, 0x1c2c0434, 0x1c2c1414,
++    0x1c2c2c2c, 0x1c340c24, 0x1c341c34, 0x1c34341c, 0x1c3e1c1c, 0x1c3e3404, 0x24040424, 0x24040c3e,
++    0x24041c2c, 0x24041c3e, 0x24042c1c, 0x24042c3e, 0x240c3e24, 0x24141404, 0x24141c3e, 0x24142404,
++    0x24143404, 0x24143434, 0x241c043e, 0x241c242c, 0x24240424, 0x24242c0c, 0x24243424, 0x242c142c,
++    0x242c241c, 0x242c3e04, 0x243e042c, 0x243e0c04, 0x243e0c14, 0x243e1c04, 0x2c040c14, 0x2c04240c,
++    0x2c043e04, 0x2c0c0404, 0x2c0c0434, 0x2c0c1434, 0x2c0c2c2c, 0x2c140c24, 0x2c141c14, 0x2c143e14,
++    0x2c1c0414, 0x2c1c2c1c, 0x2c240c04, 0x2c24141c, 0x2c24143e, 0x2c243e14, 0x2c2c0414, 0x2c2c1c0c,
++    0x2c342c04, 0x2c3e1424, 0x2c3e2414, 0x34041424, 0x34042424, 0x34042434, 0x34043424, 0x340c140c,
++    0x340c340c, 0x34140c3e, 0x34143424, 0x341c1c04, 0x341c1c34, 0x34242424, 0x342c042c, 0x342c2c14,
++    0x34341c1c, 0x343e041c, 0x343e140c, 0x3e04041c, 0x3e04042c, 0x3e04043e, 0x3e040c04, 0x3e041c14,
++    0x3e042c14, 0x3e0c1434, 0x3e0c2404, 0x3e140c14, 0x3e14242c, 0x3e142c14, 0x3e1c0404, 0x3e1c0c2c,
++    0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
++};
++
++static const uint32_t iq3s_grid[512] = {
++    0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
++    0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
++    0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
++    0x01010f0f, 0x01030101, 0x01030103, 0x01030105, 0x01030109, 0x01030301, 0x01030303, 0x0103030b,
++    0x01030501, 0x01030507, 0x0103050f, 0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b,
++    0x01030f05, 0x01050101, 0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d,
++    0x01050503, 0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
++    0x01050b07, 0x01050f01, 0x01050f07, 0x01070107, 0x01070303, 0x0107030b, 0x01070501, 0x01070505,
++    0x01070703, 0x01070707, 0x0107070d, 0x01070909, 0x01070b01, 0x01070b05, 0x01070d0f, 0x01070f03,
++    0x01070f0b, 0x01090101, 0x01090307, 0x0109030f, 0x01090503, 0x01090509, 0x01090705, 0x01090901,
++    0x01090907, 0x01090b03, 0x01090f01, 0x010b0105, 0x010b0109, 0x010b0501, 0x010b0505, 0x010b050d,
++    0x010b0707, 0x010b0903, 0x010b090b, 0x010b090f, 0x010b0d0d, 0x010b0f07, 0x010d010d, 0x010d0303,
++    0x010d0307, 0x010d0703, 0x010d0b05, 0x010d0f03, 0x010f0101, 0x010f0105, 0x010f0109, 0x010f0501,
++    0x010f0505, 0x010f050d, 0x010f0707, 0x010f0b01, 0x010f0b09, 0x03010101, 0x03010103, 0x03010105,
++    0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f, 0x03010501, 0x03010505,
++    0x03010703, 0x03010709, 0x0301070d, 0x03010b09, 0x03010b0d, 0x03010d03, 0x03010f05, 0x03030101,
++    0x03030103, 0x03030107, 0x0303010d, 0x03030301, 0x03030309, 0x03030503, 0x03030701, 0x03030707,
++    0x03030903, 0x03030b01, 0x03030b05, 0x03030f01, 0x03030f0d, 0x03050101, 0x03050305, 0x0305030b,
++    0x0305030f, 0x03050501, 0x03050509, 0x03050705, 0x03050901, 0x03050907, 0x03050b0b, 0x03050d01,
++    0x03050f05, 0x03070103, 0x03070109, 0x0307010f, 0x03070301, 0x03070307, 0x03070503, 0x0307050f,
++    0x03070701, 0x03070709, 0x03070903, 0x03070d05, 0x03070f01, 0x03090107, 0x0309010b, 0x03090305,
++    0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090d, 0x03090b01, 0x03090b09, 0x030b0103,
++    0x030b0301, 0x030b0307, 0x030b0503, 0x030b0701, 0x030b0705, 0x030b0b03, 0x030d0501, 0x030d0509,
++    0x030d050f, 0x030d0909, 0x030d090d, 0x030f0103, 0x030f0107, 0x030f0301, 0x030f0305, 0x030f0503,
++    0x030f070b, 0x030f0903, 0x030f0d05, 0x030f0f01, 0x05010101, 0x05010103, 0x05010107, 0x0501010b,
++    0x0501010f, 0x05010301, 0x05010305, 0x05010309, 0x0501030d, 0x05010503, 0x05010507, 0x0501050f,
++    0x05010701, 0x05010705, 0x05010903, 0x05010907, 0x0501090b, 0x05010b01, 0x05010b05, 0x05010d0f,
++    0x05010f01, 0x05010f07, 0x05010f0b, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030f,
++    0x05030505, 0x0503050b, 0x05030703, 0x05030709, 0x05030905, 0x05030b03, 0x05050103, 0x05050109,
++    0x0505010f, 0x05050503, 0x05050507, 0x05050701, 0x0505070f, 0x05050903, 0x05050b07, 0x05050b0f,
++    0x05050f03, 0x05050f09, 0x05070101, 0x05070105, 0x0507010b, 0x05070303, 0x05070505, 0x05070509,
++    0x05070703, 0x05070707, 0x05070905, 0x05070b01, 0x05070d0d, 0x05090103, 0x0509010f, 0x05090501,
++    0x05090507, 0x05090705, 0x0509070b, 0x05090903, 0x05090f05, 0x05090f0b, 0x050b0109, 0x050b0303,
++    0x050b0505, 0x050b070f, 0x050b0901, 0x050b0b07, 0x050b0f01, 0x050d0101, 0x050d0105, 0x050d010f,
++    0x050d0503, 0x050d0b0b, 0x050d0d03, 0x050f010b, 0x050f0303, 0x050f050d, 0x050f0701, 0x050f0907,
++    0x050f0b01, 0x07010105, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f, 0x07010505, 0x07010703,
++    0x07010707, 0x0701070b, 0x07010905, 0x07010909, 0x0701090f, 0x07010b03, 0x07010d07, 0x07010f03,
++    0x07030103, 0x07030107, 0x0703010b, 0x07030309, 0x07030503, 0x07030507, 0x07030901, 0x07030d01,
++    0x07030f05, 0x07030f0d, 0x07050101, 0x07050305, 0x07050501, 0x07050705, 0x07050709, 0x07050b01,
++    0x07070103, 0x07070301, 0x07070309, 0x07070503, 0x07070507, 0x0707050f, 0x07070701, 0x07070903,
++    0x07070907, 0x0707090f, 0x07070b0b, 0x07070f07, 0x07090107, 0x07090303, 0x0709030d, 0x07090505,
++    0x07090703, 0x07090b05, 0x07090d01, 0x07090d09, 0x070b0103, 0x070b0301, 0x070b0305, 0x070b050b,
++    0x070b0705, 0x070b0909, 0x070b0b0d, 0x070b0f07, 0x070d030d, 0x070d0903, 0x070f0103, 0x070f0107,
++    0x070f0501, 0x070f0505, 0x070f070b, 0x09010101, 0x09010109, 0x09010305, 0x09010501, 0x09010509,
++    0x0901050f, 0x09010705, 0x09010903, 0x09010b01, 0x09010f01, 0x09030105, 0x0903010f, 0x09030303,
++    0x09030307, 0x09030505, 0x09030701, 0x0903070b, 0x09030907, 0x09030b03, 0x09030b0b, 0x09050103,
++    0x09050107, 0x09050301, 0x0905030b, 0x09050503, 0x09050707, 0x09050901, 0x09050b0f, 0x09050d05,
++    0x09050f01, 0x09070109, 0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070b,
++    0x09090101, 0x09090105, 0x09090509, 0x0909070f, 0x09090901, 0x09090f03, 0x090b010b, 0x090b010f,
++    0x090b0503, 0x090b0d05, 0x090d0307, 0x090d0709, 0x090d0d01, 0x090f0301, 0x090f030b, 0x090f0701,
++    0x090f0907, 0x090f0b03, 0x0b010105, 0x0b010301, 0x0b010309, 0x0b010505, 0x0b010901, 0x0b010909,
++    0x0b01090f, 0x0b010b05, 0x0b010d0d, 0x0b010f09, 0x0b030103, 0x0b030107, 0x0b03010b, 0x0b030305,
++    0x0b030503, 0x0b030705, 0x0b030f05, 0x0b050101, 0x0b050303, 0x0b050507, 0x0b050701, 0x0b05070d,
++    0x0b050b07, 0x0b070105, 0x0b07010f, 0x0b070301, 0x0b07050f, 0x0b070909, 0x0b070b03, 0x0b070d0b,
++    0x0b070f07, 0x0b090103, 0x0b090109, 0x0b090501, 0x0b090705, 0x0b09090d, 0x0b0b0305, 0x0b0b050d,
++    0x0b0b0b03, 0x0b0b0b07, 0x0b0d0905, 0x0b0f0105, 0x0b0f0109, 0x0b0f0505, 0x0d010303, 0x0d010307,
++    0x0d01030b, 0x0d010703, 0x0d010707, 0x0d010d01, 0x0d030101, 0x0d030501, 0x0d03050f, 0x0d030d09,
++    0x0d050305, 0x0d050709, 0x0d050905, 0x0d050b0b, 0x0d050d05, 0x0d050f01, 0x0d070101, 0x0d070309,
++    0x0d070503, 0x0d070901, 0x0d09050b, 0x0d090907, 0x0d090d05, 0x0d0b0101, 0x0d0b0107, 0x0d0b0709,
++    0x0d0b0d01, 0x0d0d010b, 0x0d0d0901, 0x0d0f0303, 0x0d0f0307, 0x0f010101, 0x0f010109, 0x0f01010f,
++    0x0f010501, 0x0f010505, 0x0f01070d, 0x0f010901, 0x0f010b09, 0x0f010d05, 0x0f030105, 0x0f030303,
++    0x0f030509, 0x0f030907, 0x0f03090b, 0x0f050103, 0x0f050109, 0x0f050301, 0x0f05030d, 0x0f050503,
++    0x0f050701, 0x0f050b03, 0x0f070105, 0x0f070705, 0x0f07070b, 0x0f070b07, 0x0f090103, 0x0f09010b,
++    0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
++};
++
++static const uint8_t ksigns_iq2xs[128] = {
++      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
++    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
++    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
++     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
++    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
++     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
++     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
++    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
++};
++
++static const uint8_t kmask_iq2xs[8] = {
++    1, 2, 4, 8, 16, 32, 64, 128
++};
++static const uint64_t iq1s_grid[2048] = {
++    0xffffffffffffffff, 0xffffffffffffff01, 0xffffffffffff0000, 0xffffffffffff01ff,
++    0xffffffffffff0101, 0xffffffffff00ff00, 0xffffffffff000000, 0xffffffffff01ffff,
++    0xffffffffff01ff01, 0xffffffffff0101ff, 0xffffffffff010101, 0xffffffff00ff0000,
++    0xffffffff0000ff00, 0xffffffff000000ff, 0xffffffff00000001, 0xffffffff00010000,
++    0xffffffff01ffffff, 0xffffffff01ffff01, 0xffffffff01ff01ff, 0xffffffff01ff0101,
++    0xffffffff01000000, 0xffffffff0101ffff, 0xffffffff0101ff01, 0xffffffff010101ff,
++    0xffffffff01010101, 0xffffff00ffff00ff, 0xffffff00ffff0000, 0xffffff00ff00ff00,
++    0xffffff00ff0000ff, 0xffffff00ff000001, 0xffffff00ff000100, 0xffffff00ff000101,
++    0xffffff00ff010000, 0xffffff0000ffff00, 0xffffff0000ff0001, 0xffffff0000ff0100,
++    0xffffff000000ff01, 0xffffff0000000000, 0xffffff0000000101, 0xffffff000001ff00,
++    0xffffff00000100ff, 0xffffff0000010001, 0xffffff00000101ff, 0xffffff0001ff0000,
++    0xffffff000100ff00, 0xffffff00010000ff, 0xffffff0001000001, 0xffffff0001010000,
++    0xffffff01ffffffff, 0xffffff01ffffff01, 0xffffff01ffff01ff, 0xffffff01ffff0101,
++    0xffffff01ff000000, 0xffffff01ff01ffff, 0xffffff01ff01ff01, 0xffffff01ff0101ff,
++    0xffffff01ff010101, 0xffffff0100ff0000, 0xffffff010000ff00, 0xffffff0100000100,
++    0xffffff01000100ff, 0xffffff0100010100, 0xffffff0101ffffff, 0xffffff0101ffff01,
++    0xffffff0101ff01ff, 0xffffff0101ff0101, 0xffffff010100ff00, 0xffffff0101000000,
++    0xffffff0101000100, 0xffffff010101ffff, 0xffffff010101ff01, 0xffffff01010101ff,
++    0xffffff0101010101, 0xffff00ffff00ff00, 0xffff00ffff0000ff, 0xffff00ffff000001,
++    0xffff00ffff010000, 0xffff00ff00ffff00, 0xffff00ff00ff0100, 0xffff00ff00000000,
++    0xffff00ff00000101, 0xffff00ff000100ff, 0xffff00ff00010000, 0xffff00ff0100ff00,
++    0xffff00ff01000100, 0xffff00ff01010000, 0xffff0000ffffff00, 0xffff0000ffff00ff,
++    0xffff0000ffff0000, 0xffff0000ffff0001, 0xffff0000ff000000, 0xffff0000ff0001ff,
++    0xffff0000ff000101, 0xffff0000ff010100, 0xffff000000ffffff, 0xffff000000ff0000,
++    0xffff000000ff0101, 0xffff00000000ffff, 0xffff00000000ff00, 0xffff0000000000ff,
++    0xffff000000000000, 0xffff000000000001, 0xffff000000000100, 0xffff00000001ffff,
++    0xffff00000001ff01, 0xffff000000010000, 0xffff0000000101ff, 0xffff000000010101,
++    0xffff000001ffff00, 0xffff00000100ff00, 0xffff000001000000, 0xffff0000010001ff,
++    0xffff000001000101, 0xffff00000101ff00, 0xffff0000010100ff, 0xffff000001010000,
++    0xffff000001010001, 0xffff000001010100, 0xffff0001ff0000ff, 0xffff0001ff000100,
++    0xffff000100ffff00, 0xffff000100ff00ff, 0xffff00010000ffff, 0xffff00010000ff01,
++    0xffff000100000000, 0xffff0001000001ff, 0xffff00010001ffff, 0xffff00010001ff00,
++    0xffff000100010001, 0xffff000100010100, 0xffff000101ff0000, 0xffff00010100ff00,
++    0xffff0001010000ff, 0xffff000101000100, 0xffff01ffffffffff, 0xffff01ffffffff01,
++    0xffff01ffffff01ff, 0xffff01ffffff0101, 0xffff01ffff000000, 0xffff01ffff01ffff,
++    0xffff01ffff01ff01, 0xffff01ffff0101ff, 0xffff01ffff010101, 0xffff01ff00ff0000,
++    0xffff01ff0000ff00, 0xffff01ff00000001, 0xffff01ff00010000, 0xffff01ff01ffffff,
++    0xffff01ff01ffff01, 0xffff01ff01ff01ff, 0xffff01ff01ff0101, 0xffff01ff01000000,
++    0xffff01ff0101ffff, 0xffff01ff0101ff01, 0xffff01ff010101ff, 0xffff01ff01010101,
++    0xffff0100ffff0000, 0xffff0100ff00ff00, 0xffff0100ff0000ff, 0xffff0100ff000100,
++    0xffff0100ff0100ff, 0xffff0100ff010000, 0xffff010000ffff00, 0xffff01000000ffff,
++    0xffff01000000ff00, 0xffff010000000000, 0xffff01000001ff00, 0xffff0100000100ff,
++    0xffff010000010100, 0xffff01000100ff00, 0xffff0100010000ff, 0xffff010001000001,
++    0xffff010001000100, 0xffff010001010000, 0xffff0101ffffffff, 0xffff0101ffffff01,
++    0xffff0101ffff01ff, 0xffff0101ffff0101, 0xffff0101ff000000, 0xffff0101ff01ffff,
++    0xffff0101ff01ff01, 0xffff0101ff0101ff, 0xffff0101ff010101, 0xffff010100ff0000,
++    0xffff01010000ff00, 0xffff010100000100, 0xffff01010001ff00, 0xffff010100010000,
++    0xffff010101ffffff, 0xffff010101ffff01, 0xffff010101ff0000, 0xffff010101ff01ff,
++    0xffff010101ff0101, 0xffff010101000000, 0xffff01010101ffff, 0xffff01010101ff01,
++    0xffff0101010101ff, 0xffff010101010101, 0xff00ffffff00ffff, 0xff00ffffff00ff00,
++    0xff00ffffff0000ff, 0xff00ffffff000100, 0xff00ffffff0100ff, 0xff00ffffff010000,
++    0xff00ffff00ffff00, 0xff00ffff00ff00ff, 0xff00ffff0000ffff, 0xff00ffff00000000,
++    0xff00ffff000001ff, 0xff00ffff0001ff00, 0xff00ffff000100ff, 0xff00ffff00010000,
++    0xff00ffff00010100, 0xff00ffff0100ff00, 0xff00ffff010000ff, 0xff00ffff01000001,
++    0xff00ffff0101ff00, 0xff00ffff01010000, 0xff00ff00ffffff00, 0xff00ff00ffff00ff,
++    0xff00ff00ffff0001, 0xff00ff00ffff0100, 0xff00ff00ff00ffff, 0xff00ff00ff00ff01,
++    0xff00ff00ff000000, 0xff00ff00ff0001ff, 0xff00ff00ff01ff00, 0xff00ff00ff0100ff,
++    0xff00ff00ff010100, 0xff00ff0000ff0000, 0xff00ff0000ff0101, 0xff00ff000000ffff,
++    0xff00ff000000ff00, 0xff00ff000000ff01, 0xff00ff00000000ff, 0xff00ff0000000000,
++    0xff00ff0000000001, 0xff00ff0000000100, 0xff00ff000001ffff, 0xff00ff0000010000,
++    0xff00ff0001ff00ff, 0xff00ff000100ff01, 0xff00ff0001000000, 0xff00ff000101ff00,
++    0xff00ff00010100ff, 0xff00ff01ff00ff00, 0xff00ff01ff0000ff, 0xff00ff01ff000001,
++    0xff00ff01ff010000, 0xff00ff0100ffffff, 0xff00ff0100ff0001, 0xff00ff0100ff0100,
++    0xff00ff010000ff01, 0xff00ff0100000000, 0xff00ff01000001ff, 0xff00ff0100000101,
++    0xff00ff01000100ff, 0xff00ff0100010001, 0xff00ff0101ff0000, 0xff00ff010100ff00,
++    0xff00ff01010000ff, 0xff00ff0101000001, 0xff00ff0101010000, 0xff0000ffffffff00,
++    0xff0000ffffff0001, 0xff0000ffffff0100, 0xff0000ffff0000ff, 0xff0000ffff000000,
++    0xff0000ffff0001ff, 0xff0000ffff000100, 0xff0000ffff01ff00, 0xff0000ffff010001,
++    0xff0000ff00ffff00, 0xff0000ff00ff0000, 0xff0000ff00ff0001, 0xff0000ff00ff01ff,
++    0xff0000ff00ff0101, 0xff0000ff0000ff00, 0xff0000ff000000ff, 0xff0000ff00000000,
++    0xff0000ff00000001, 0xff0000ff00000100, 0xff0000ff0001ff01, 0xff0000ff00010000,
++    0xff0000ff000101ff, 0xff0000ff01ff00ff, 0xff0000ff01ff0100, 0xff0000ff0100ffff,
++    0xff0000ff010000ff, 0xff0000ff01000000, 0xff0000ff010001ff, 0xff0000ff01000100,
++    0xff0000ff01000101, 0xff0000ff0101ff00, 0xff0000ff010100ff, 0xff0000ff01010000,
++    0xff0000ff01010100, 0xff000000ffffff01, 0xff000000ffff0000, 0xff000000ffff0101,
++    0xff000000ff00ff00, 0xff000000ff0000ff, 0xff000000ff000000, 0xff000000ff000001,
++    0xff000000ff000100, 0xff000000ff01ffff, 0xff000000ff01ff01, 0xff000000ff010000,
++    0xff000000ff0101ff, 0xff000000ff010101, 0xff00000000ffff00, 0xff00000000ff00ff,
++    0xff00000000ff0000, 0xff00000000ff0001, 0xff0000000000ff00, 0xff0000000000ff01,
++    0xff000000000000ff, 0xff00000000000000, 0xff00000000000001, 0xff00000000000100,
++    0xff00000000000101, 0xff0000000001ff00, 0xff000000000100ff, 0xff00000000010000,
++    0xff00000000010001, 0xff00000000010100, 0xff00000001ffffff, 0xff00000001ffff01,
++    0xff00000001ff00ff, 0xff00000001ff0000, 0xff00000001ff01ff, 0xff00000001ff0101,
++    0xff0000000100ffff, 0xff0000000100ff00, 0xff000000010000ff, 0xff00000001000000,
++    0xff00000001000001, 0xff00000001000100, 0xff00000001000101, 0xff0000000101ffff,
++    0xff0000000101ff01, 0xff00000001010000, 0xff000001ffffff00, 0xff000001ffff00ff,
++    0xff000001ffff0000, 0xff000001ffff0001, 0xff000001ff000000, 0xff000001ff000001,
++    0xff000001ff0001ff, 0xff000001ff000101, 0xff000001ff01ff00, 0xff000001ff010001,
++    0xff00000100ffffff, 0xff00000100ffff01, 0xff00000100ff00ff, 0xff00000100ff0000,
++    0xff00000100ff01ff, 0xff00000100ff0101, 0xff0000010000ff00, 0xff00000100000000,
++    0xff00000100000001, 0xff000001000001ff, 0xff00000100000100, 0xff0000010001ff00,
++    0xff000001000100ff, 0xff00000100010000, 0xff000001000101ff, 0xff00000100010100,
++    0xff00000100010101, 0xff00000101ff0001, 0xff00000101ff0101, 0xff0000010100ff01,
++    0xff00000101000000, 0xff000001010100ff, 0xff00000101010100, 0xff0001ffff00ff00,
++    0xff0001ffff000001, 0xff0001ffff010000, 0xff0001ff00ffff00, 0xff0001ff00ff00ff,
++    0xff0001ff00ff0001, 0xff0001ff00ff0100, 0xff0001ff0000ffff, 0xff0001ff00000000,
++    0xff0001ff000001ff, 0xff0001ff00000101, 0xff0001ff0001ffff, 0xff0001ff0001ff00,
++    0xff0001ff000100ff, 0xff0001ff00010001, 0xff0001ff00010100, 0xff0001ff01ff0000,
++    0xff0001ff0100ff00, 0xff0001ff010000ff, 0xff0001ff01010000, 0xff000100ff00ffff,
++    0xff000100ff00ff01, 0xff000100ff000000, 0xff000100ff000101, 0xff000100ff01ff00,
++    0xff000100ff010000, 0xff00010000ffff01, 0xff00010000ff00ff, 0xff00010000ff0000,
++    0xff00010000ff01ff, 0xff0001000000ff00, 0xff000100000000ff, 0xff00010000000000,
++    0xff00010000000001, 0xff00010000000100, 0xff00010000000101, 0xff0001000001ffff,
++    0xff00010000010000, 0xff00010000010101, 0xff00010001ff0100, 0xff0001000100ff00,
++    0xff0001000100ff01, 0xff00010001000000, 0xff000100010001ff, 0xff0001000101ff00,
++    0xff00010001010001, 0xff00010001010100, 0xff000101ffff0100, 0xff000101ff000001,
++    0xff000101ff0100ff, 0xff000101ff010001, 0xff00010100ff00ff, 0xff00010100ff0001,
++    0xff00010100ff0100, 0xff0001010000ffff, 0xff0001010000ff01, 0xff00010100000000,
++    0xff000101000001ff, 0xff0001010001ff00, 0xff00010100010001, 0xff00010100010100,
++    0xff00010101ff0000, 0xff0001010100ff00, 0xff00010101000001, 0xff00010101000101,
++    0xff01ffffffffffff, 0xff01ffffffffff01, 0xff01ffffffff01ff, 0xff01ffffffff0101,
++    0xff01ffffff000000, 0xff01ffffff01ffff, 0xff01ffffff01ff01, 0xff01ffffff010000,
++    0xff01ffffff0101ff, 0xff01ffffff010101, 0xff01ffff00ff0000, 0xff01ffff0000ff00,
++    0xff01ffff00000100, 0xff01ffff0001ff00, 0xff01ffff00010000, 0xff01ffff01ffffff,
++    0xff01ffff01ffff01, 0xff01ffff01ff01ff, 0xff01ffff01ff0101, 0xff01ffff01000000,
++    0xff01ffff0101ffff, 0xff01ffff0101ff01, 0xff01ffff01010000, 0xff01ffff010101ff,
++    0xff01ffff01010101, 0xff01ff00ffff0000, 0xff01ff00ff00ff00, 0xff01ff00ff0000ff,
++    0xff01ff00ff000100, 0xff01ff00ff010000, 0xff01ff0000ffff01, 0xff01ff0000ff00ff,
++    0xff01ff0000ff0100, 0xff01ff0000000000, 0xff01ff00000001ff, 0xff01ff0000000101,
++    0xff01ff000001ff00, 0xff01ff00000100ff, 0xff01ff0000010000, 0xff01ff0000010001,
++    0xff01ff0001ff0000, 0xff01ff000100ffff, 0xff01ff0001000001, 0xff01ff0001000100,
++    0xff01ff0001010000, 0xff01ff01ffffff00, 0xff01ff01ffff01ff, 0xff01ff01ffff0101,
++    0xff01ff01ff00ff00, 0xff01ff01ff000000, 0xff01ff01ff01ffff, 0xff01ff01ff01ff01,
++    0xff01ff01ff0101ff, 0xff01ff01ff010101, 0xff01ff0100ff0000, 0xff01ff010000ff00,
++    0xff01ff0100000001, 0xff01ff0100000100, 0xff01ff0100010000, 0xff01ff0101ffff00,
++    0xff01ff0101ff01ff, 0xff01ff0101ff0101, 0xff01ff010100ff00, 0xff01ff0101000000,
++    0xff01ff010101ffff, 0xff01ff010101ff01, 0xff01ff01010101ff, 0xff01ff0101010101,
++    0xff0100ffffff0000, 0xff0100ffff0000ff, 0xff0100ffff000001, 0xff0100ffff000100,
++    0xff0100ffff010000, 0xff0100ff00ff00ff, 0xff0100ff00ff0000, 0xff0100ff00ff0001,
++    0xff0100ff00ff0100, 0xff0100ff0000ff01, 0xff0100ff00000000, 0xff0100ff000001ff,
++    0xff0100ff00000101, 0xff0100ff00010001, 0xff0100ff01ff0000, 0xff0100ff0100ff00,
++    0xff0100ff010000ff, 0xff0100ff01000100, 0xff0100ff0101ff00, 0xff0100ff01010000,
++    0xff010000ffff0100, 0xff010000ff000000, 0xff010000ff01ff00, 0xff010000ff010100,
++    0xff01000000ffffff, 0xff01000000ff0000, 0xff01000000ff01ff, 0xff0100000000ff00,
++    0xff010000000000ff, 0xff01000000000000, 0xff01000000000100, 0xff0100000001ff01,
++    0xff01000000010000, 0xff010000000101ff, 0xff01000001ff0100, 0xff0100000100ffff,
++    0xff010000010000ff, 0xff01000001000000, 0xff010000010001ff, 0xff01000001000101,
++    0xff0100000101ff00, 0xff010000010100ff, 0xff01000001010001, 0xff01000001010100,
++    0xff010001ffff0000, 0xff010001ff00ffff, 0xff010001ff00ff01, 0xff010001ff000100,
++    0xff010001ff010000, 0xff01000100ffff00, 0xff01000100ff0100, 0xff01000100000000,
++    0xff0100010001ffff, 0xff0100010001ff00, 0xff01000100010100, 0xff01000101ff00ff,
++    0xff01000101ff0001, 0xff0100010100ffff, 0xff01000101000101, 0xff0101ffffffffff,
++    0xff0101ffffffff01, 0xff0101ffffff01ff, 0xff0101ffffff0101, 0xff0101ffff000000,
++    0xff0101ffff01ffff, 0xff0101ffff01ff01, 0xff0101ffff0101ff, 0xff0101ffff010101,
++    0xff0101ff00ff0000, 0xff0101ff0000ff00, 0xff0101ff000000ff, 0xff0101ff00010000,
++    0xff0101ff01ffffff, 0xff0101ff01ffff01, 0xff0101ff01ff01ff, 0xff0101ff01ff0101,
++    0xff0101ff0101ffff, 0xff0101ff0101ff01, 0xff0101ff010101ff, 0xff0101ff01010101,
++    0xff010100ffff0100, 0xff010100ff00ff00, 0xff010100ff0000ff, 0xff010100ff000100,
++    0xff010100ff010000, 0xff01010000ff0001, 0xff01010000ff0100, 0xff0101000000ff01,
++    0xff01010000000000, 0xff0101000001ff00, 0xff010100000100ff, 0xff01010000010001,
++    0xff01010000010100, 0xff01010001ff0000, 0xff0101000100ffff, 0xff01010001000001,
++    0xff01010001000100, 0xff010100010100ff, 0xff01010001010000, 0xff010101ffffffff,
++    0xff010101ffffff01, 0xff010101ffff01ff, 0xff010101ffff0101, 0xff010101ff01ffff,
++    0xff010101ff01ff01, 0xff010101ff0101ff, 0xff010101ff010101, 0xff01010100ff0000,
++    0xff0101010000ff00, 0xff01010100000001, 0xff01010100000100, 0xff01010100010000,
++    0xff01010101ffffff, 0xff01010101ffff01, 0xff01010101ff01ff, 0xff01010101ff0101,
++    0xff01010101000000, 0xff0101010101ffff, 0xff0101010101ff01, 0xff010101010101ff,
++    0xff01010101010101, 0x00ffffffffff0000, 0x00ffffffff00ff00, 0x00ffffffff000001,
++    0x00ffffffff010000, 0x00ffffff00ff0100, 0x00ffffff0000ff01, 0x00ffffff00000000,
++    0x00ffffff000001ff, 0x00ffffff00000101, 0x00ffffff0001ff00, 0x00ffffff000100ff,
++    0x00ffffff00010001, 0x00ffffff010000ff, 0x00ffffff01000100, 0x00ffffff0101ff00,
++    0x00ffffff01010001, 0x00ffff00ffffffff, 0x00ffff00ffffff00, 0x00ffff00ffff00ff,
++    0x00ffff00ffff0001, 0x00ffff00ffff0100, 0x00ffff00ff00ff01, 0x00ffff00ff000000,
++    0x00ffff00ff000001, 0x00ffff00ff0001ff, 0x00ffff00ff000101, 0x00ffff00ff01ff00,
++    0x00ffff00ff010001, 0x00ffff00ff010100, 0x00ffff0000ff0000, 0x00ffff0000ff01ff,
++    0x00ffff0000ff0101, 0x00ffff000000ff00, 0x00ffff00000000ff, 0x00ffff0000000000,
++    0x00ffff0000000001, 0x00ffff0000000100, 0x00ffff0000000101, 0x00ffff0000010000,
++    0x00ffff00000101ff, 0x00ffff0000010101, 0x00ffff0001ffff00, 0x00ffff0001ff00ff,
++    0x00ffff0001ff0001, 0x00ffff000100ffff, 0x00ffff000100ff01, 0x00ffff0001000000,
++    0x00ffff000101ffff, 0x00ffff000101ff00, 0x00ffff000101ff01, 0x00ffff01ffff0000,
++    0x00ffff01ff00ff00, 0x00ffff01ff0000ff, 0x00ffff01ff000001, 0x00ffff01ff010000,
++    0x00ffff0100ffff00, 0x00ffff010000ff01, 0x00ffff0100000000, 0x00ffff0100000101,
++    0x00ffff01000100ff, 0x00ffff0100010100, 0x00ffff0101ff0100, 0x00ffff01010000ff,
++    0x00ffff0101010000, 0x00ff00ffffffff00, 0x00ff00ffff000000, 0x00ff00ffff000100,
++    0x00ff00ffff010100, 0x00ff00ff00ff0000, 0x00ff00ff00ff01ff, 0x00ff00ff00ff0101,
++    0x00ff00ff0000ff00, 0x00ff00ff000000ff, 0x00ff00ff00000000, 0x00ff00ff00000001,
++    0x00ff00ff0001ff00, 0x00ff00ff0001ff01, 0x00ff00ff00010000, 0x00ff00ff000101ff,
++    0x00ff00ff00010101, 0x00ff00ff01ffff00, 0x00ff00ff01ff0001, 0x00ff00ff01ff0100,
++    0x00ff00ff0100ffff, 0x00ff00ff0100ff01, 0x00ff00ff01000000, 0x00ff00ff0101ffff,
++    0x00ff00ff0101ff00, 0x00ff00ff01010100, 0x00ff0000ffffff00, 0x00ff0000ffffff01,
++    0x00ff0000ffff0000, 0x00ff0000ffff0101, 0x00ff0000ff00ff00, 0x00ff0000ff0000ff,
++    0x00ff0000ff000000, 0x00ff0000ff000001, 0x00ff0000ff000100, 0x00ff0000ff01ffff,
++    0x00ff0000ff010000, 0x00ff0000ff010101, 0x00ff000000ffff00, 0x00ff000000ff00ff,
++    0x00ff000000ff0000, 0x00ff000000ff0001, 0x00ff000000ff0100, 0x00ff00000000ffff,
++    0x00ff00000000ff00, 0x00ff0000000000ff, 0x00ff000000000000, 0x00ff000000000001,
++    0x00ff0000000001ff, 0x00ff000000000100, 0x00ff00000001ff00, 0x00ff0000000100ff,
++    0x00ff000000010000, 0x00ff000000010001, 0x00ff000000010100, 0x00ff000001ffff01,
++    0x00ff000001ff00ff, 0x00ff000001ff0000, 0x00ff000001ff01ff, 0x00ff00000100ff00,
++    0x00ff0000010000ff, 0x00ff000001000000, 0x00ff000001000001, 0x00ff000001000100,
++    0x00ff000001000101, 0x00ff000001010000, 0x00ff0000010101ff, 0x00ff000001010101,
++    0x00ff0001ffffff00, 0x00ff0001ffff0000, 0x00ff0001ffff0100, 0x00ff0001ff0000ff,
++    0x00ff0001ff000000, 0x00ff0001ff0001ff, 0x00ff0001ff000101, 0x00ff0001ff01ff00,
++    0x00ff0001ff0100ff, 0x00ff0001ff010100, 0x00ff000100ffffff, 0x00ff000100ffff01,
++    0x00ff000100ff0000, 0x00ff000100ff01ff, 0x00ff00010000ffff, 0x00ff00010000ff00,
++    0x00ff00010000ff01, 0x00ff000100000000, 0x00ff000100000001, 0x00ff000100000100,
++    0x00ff00010001ff01, 0x00ff000100010000, 0x00ff0001000101ff, 0x00ff000101ffff00,
++    0x00ff000101ff0000, 0x00ff000101ff0101, 0x00ff0001010000ff, 0x00ff000101000000,
++    0x00ff00010101ff00, 0x00ff0001010100ff, 0x00ff000101010001, 0x00ff01ffffff0000,
++    0x00ff01ffff00ff00, 0x00ff01ffff000000, 0x00ff01ffff000101, 0x00ff01ffff010000,
++    0x00ff01ff00ffff01, 0x00ff01ff00ff0100, 0x00ff01ff0000ffff, 0x00ff01ff00000000,
++    0x00ff01ff000001ff, 0x00ff01ff0001ff00, 0x00ff01ff000100ff, 0x00ff01ff00010001,
++    0x00ff01ff00010100, 0x00ff01ff01ff0000, 0x00ff01ff0100ff00, 0x00ff01ff010000ff,
++    0x00ff01ff01000001, 0x00ff01ff01000100, 0x00ff01ff01010000, 0x00ff0100ffffff00,
++    0x00ff0100ffff0000, 0x00ff0100ffff0001, 0x00ff0100ffff0101, 0x00ff0100ff00ffff,
++    0x00ff0100ff0000ff, 0x00ff0100ff000000, 0x00ff0100ff0001ff, 0x00ff0100ff01ff00,
++    0x00ff0100ff0100ff, 0x00ff0100ff010001, 0x00ff010000ffffff, 0x00ff010000ff0000,
++    0x00ff010000ff0101, 0x00ff01000000ff00, 0x00ff01000000ff01, 0x00ff0100000000ff,
++    0x00ff010000000000, 0x00ff010000000001, 0x00ff010000000100, 0x00ff01000001ffff,
++    0x00ff01000001ff01, 0x00ff010000010000, 0x00ff010000010001, 0x00ff010000010101,
++    0x00ff010001ff0001, 0x00ff010001ff0100, 0x00ff01000100ff01, 0x00ff010001000000,
++    0x00ff010001000001, 0x00ff0100010001ff, 0x00ff01000101ff00, 0x00ff0100010100ff,
++    0x00ff010001010001, 0x00ff010001010100, 0x00ff0101ff000001, 0x00ff010100ff00ff,
++    0x00ff010100ff0001, 0x00ff010100ff0100, 0x00ff010100000000, 0x00ff0101000001ff,
++    0x00ff010100000101, 0x00ff0101000100ff, 0x00ff010100010100, 0x00ff0101010000ff,
++    0x00ff010101010000, 0x0000ffffffffff00, 0x0000ffffffff00ff, 0x0000ffffffff0000,
++    0x0000ffffffff0001, 0x0000ffffffff0100, 0x0000ffffff00ff01, 0x0000ffffff000000,
++    0x0000ffffff000101, 0x0000ffffff01ff00, 0x0000ffffff0100ff, 0x0000ffffff010100,
++    0x0000ffff00ffffff, 0x0000ffff00ff0000, 0x0000ffff00ff01ff, 0x0000ffff0000ff00,
++    0x0000ffff000000ff, 0x0000ffff00000000, 0x0000ffff00000001, 0x0000ffff00000100,
++    0x0000ffff00010000, 0x0000ffff000101ff, 0x0000ffff01ff0001, 0x0000ffff01ff0100,
++    0x0000ffff01000000, 0x0000ffff010001ff, 0x0000ffff0101ffff, 0x0000ffff0101ff00,
++    0x0000ffff01010001, 0x0000ffff01010100, 0x0000ff00ffff0000, 0x0000ff00ffff01ff,
++    0x0000ff00ffff0100, 0x0000ff00ffff0101, 0x0000ff00ff00ff00, 0x0000ff00ff0000ff,
++    0x0000ff00ff000000, 0x0000ff00ff000001, 0x0000ff00ff0001ff, 0x0000ff00ff000100,
++    0x0000ff00ff01ffff, 0x0000ff00ff010000, 0x0000ff00ff010001, 0x0000ff00ff0101ff,
++    0x0000ff00ff010101, 0x0000ff0000ffff00, 0x0000ff0000ff00ff, 0x0000ff0000ff0000,
++    0x0000ff0000ff0001, 0x0000ff0000ff0100, 0x0000ff000000ffff, 0x0000ff000000ff00,
++    0x0000ff000000ff01, 0x0000ff00000000ff, 0x0000ff0000000000, 0x0000ff0000000001,
++    0x0000ff00000001ff, 0x0000ff0000000100, 0x0000ff0000000101, 0x0000ff000001ff00,
++    0x0000ff00000100ff, 0x0000ff0000010000, 0x0000ff0000010001, 0x0000ff0000010100,
++    0x0000ff0001ffff01, 0x0000ff0001ff0000, 0x0000ff000100ff00, 0x0000ff00010000ff,
++    0x0000ff0001000000, 0x0000ff0001000001, 0x0000ff0001000100, 0x0000ff000101ffff,
++    0x0000ff0001010000, 0x0000ff0001010101, 0x0000ff01ffffff00, 0x0000ff01ffff0001,
++    0x0000ff01ff00ff01, 0x0000ff01ff000000, 0x0000ff01ff000101, 0x0000ff01ff01ff00,
++    0x0000ff01ff0100ff, 0x0000ff0100ffff01, 0x0000ff0100ff0000, 0x0000ff0100ff0101,
++    0x0000ff010000ff00, 0x0000ff01000000ff, 0x0000ff0100000000, 0x0000ff0100000001,
++    0x0000ff0100000100, 0x0000ff010001ff01, 0x0000ff0100010000, 0x0000ff0101ff0000,
++    0x0000ff010100ffff, 0x0000ff010100ff01, 0x0000ff0101000000, 0x0000ff0101000100,
++    0x0000ff0101000101, 0x0000ff01010100ff, 0x000000ffffff00ff, 0x000000ffffff0000,
++    0x000000ffff00ff00, 0x000000ffff0000ff, 0x000000ffff000000, 0x000000ffff000001,
++    0x000000ffff0001ff, 0x000000ffff000100, 0x000000ffff01ff00, 0x000000ffff010000,
++    0x000000ffff0101ff, 0x000000ffff010101, 0x000000ff00ffff00, 0x000000ff00ff00ff,
++    0x000000ff00ff0000, 0x000000ff00ff0001, 0x000000ff00ff0100, 0x000000ff00ff0101,
++    0x000000ff0000ffff, 0x000000ff0000ff00, 0x000000ff000000ff, 0x000000ff00000000,
++    0x000000ff00000001, 0x000000ff000001ff, 0x000000ff00000100, 0x000000ff00000101,
++    0x000000ff0001ff00, 0x000000ff0001ff01, 0x000000ff000100ff, 0x000000ff00010000,
++    0x000000ff00010001, 0x000000ff00010100, 0x000000ff01ffffff, 0x000000ff01ff01ff,
++    0x000000ff01ff0101, 0x000000ff0100ff00, 0x000000ff010000ff, 0x000000ff01000000,
++    0x000000ff01000001, 0x000000ff01000100, 0x000000ff0101ff00, 0x000000ff010100ff,
++    0x000000ff01010000, 0x000000ff01010101, 0x00000000ffffff00, 0x00000000ffffff01,
++    0x00000000ffff00ff, 0x00000000ffff0000, 0x00000000ffff0001, 0x00000000ffff0100,
++    0x00000000ff00ffff, 0x00000000ff00ff00, 0x00000000ff00ff01, 0x00000000ff0000ff,
++    0x00000000ff000000, 0x00000000ff000001, 0x00000000ff000100, 0x00000000ff000101,
++    0x00000000ff01ff00, 0x00000000ff0100ff, 0x00000000ff010000, 0x00000000ff010001,
++    0x00000000ff010100, 0x0000000000ffffff, 0x0000000000ffff00, 0x0000000000ffff01,
++    0x0000000000ff00ff, 0x0000000000ff0000, 0x0000000000ff0001, 0x0000000000ff01ff,
++    0x0000000000ff0100, 0x000000000000ffff, 0x000000000000ff00, 0x000000000000ff01,
++    0x00000000000000ff, 0x0000000000000000, 0x0000000000000001, 0x00000000000001ff,
++    0x0000000000000100, 0x0000000000000101, 0x000000000001ffff, 0x000000000001ff00,
++    0x00000000000100ff, 0x0000000000010000, 0x0000000000010001, 0x00000000000101ff,
++    0x0000000000010100, 0x0000000000010101, 0x0000000001ffff00, 0x0000000001ff00ff,
++    0x0000000001ff0000, 0x0000000001ff0100, 0x0000000001ff0101, 0x000000000100ffff,
++    0x000000000100ff00, 0x00000000010000ff, 0x0000000001000000, 0x0000000001000001,
++    0x00000000010001ff, 0x0000000001000100, 0x000000000101ff00, 0x00000000010100ff,
++    0x0000000001010000, 0x0000000001010001, 0x0000000001010100, 0x00000001ffffffff,
++    0x00000001ffffff00, 0x00000001ffffff01, 0x00000001ffff00ff, 0x00000001ffff0001,
++    0x00000001ffff01ff, 0x00000001ffff0100, 0x00000001ff00ff00, 0x00000001ff0000ff,
++    0x00000001ff000000, 0x00000001ff0001ff, 0x00000001ff000100, 0x00000001ff01ffff,
++    0x00000001ff01ff00, 0x00000001ff01ff01, 0x00000001ff0100ff, 0x00000001ff010000,
++    0x00000001ff010001, 0x00000001ff0101ff, 0x00000001ff010100, 0x0000000100ffff00,
++    0x0000000100ff0000, 0x0000000100ff0001, 0x0000000100ff01ff, 0x0000000100ff0100,
++    0x0000000100ff0101, 0x000000010000ffff, 0x000000010000ff00, 0x000000010000ff01,
++    0x00000001000000ff, 0x0000000100000000, 0x0000000100000001, 0x00000001000001ff,
++    0x0000000100000100, 0x0000000100000101, 0x000000010001ff00, 0x00000001000100ff,
++    0x0000000100010000, 0x0000000100010100, 0x0000000101ffff01, 0x0000000101ff0000,
++    0x0000000101ff0001, 0x0000000101ff01ff, 0x0000000101ff0100, 0x0000000101ff0101,
++    0x000000010100ff00, 0x0000000101000000, 0x0000000101000101, 0x000000010101ff01,
++    0x0000000101010000, 0x0000000101010001, 0x00000001010101ff, 0x0000000101010100,
++    0x000001ffffff00ff, 0x000001ffffff0000, 0x000001ffffff0001, 0x000001ffffff0100,
++    0x000001ffff00ffff, 0x000001ffff000000, 0x000001ffff0001ff, 0x000001ffff01ff00,
++    0x000001ffff010101, 0x000001ff00ff0000, 0x000001ff00ff01ff, 0x000001ff00ff0101,
++    0x000001ff0000ff00, 0x000001ff000000ff, 0x000001ff00000000, 0x000001ff00000001,
++    0x000001ff000001ff, 0x000001ff00000100, 0x000001ff0001ffff, 0x000001ff0001ff01,
++    0x000001ff000100ff, 0x000001ff00010000, 0x000001ff01ffff01, 0x000001ff01ff0100,
++    0x000001ff0100ffff, 0x000001ff0100ff01, 0x000001ff01000000, 0x000001ff010001ff,
++    0x000001ff0101ff00, 0x000001ff01010100, 0x00000100ffffff00, 0x00000100ffffff01,
++    0x00000100ffff0000, 0x00000100ffff0101, 0x00000100ff00ff00, 0x00000100ff0000ff,
++    0x00000100ff000000, 0x00000100ff000001, 0x00000100ff000100, 0x00000100ff010000,
++    0x0000010000ffff00, 0x0000010000ff00ff, 0x0000010000ff0000, 0x0000010000ff0001,
++    0x0000010000ff0100, 0x000001000000ffff, 0x000001000000ff00, 0x000001000000ff01,
++    0x00000100000000ff, 0x0000010000000000, 0x0000010000000001, 0x00000100000001ff,
++    0x0000010000000100, 0x0000010000000101, 0x000001000001ff00, 0x00000100000100ff,
++    0x0000010000010000, 0x0000010000010001, 0x0000010000010100, 0x0000010001ffff00,
++    0x0000010001ff0000, 0x0000010001ff0100, 0x000001000100ff00, 0x00000100010000ff,
++    0x0000010001000000, 0x0000010001000001, 0x00000100010001ff, 0x0000010001000100,
++    0x0000010001010000, 0x00000101ffff00ff, 0x00000101ffff01ff, 0x00000101ff000000,
++    0x00000101ff000101, 0x00000101ff01ffff, 0x00000101ff010000, 0x00000101ff010001,
++    0x00000101ff010100, 0x0000010100ff0000, 0x0000010100ff01ff, 0x0000010100ff0100,
++    0x000001010000ff00, 0x0000010100000000, 0x0000010100000001, 0x00000101000001ff,
++    0x0000010100000100, 0x000001010001ff01, 0x0000010100010000, 0x00000101000101ff,
++    0x0000010100010101, 0x0000010101ffff00, 0x0000010101ff0101, 0x000001010100ff01,
++    0x0000010101000000, 0x0000010101000001, 0x00000101010001ff, 0x0000010101000101,
++    0x000001010101ff00, 0x0001ffffffff0000, 0x0001ffffff0000ff, 0x0001ffffff000001,
++    0x0001ffffff000100, 0x0001ffffff010000, 0x0001ffff00ff00ff, 0x0001ffff0000ffff,
++    0x0001ffff00000000, 0x0001ffff00000001, 0x0001ffff000001ff, 0x0001ffff00000101,
++    0x0001ffff0001ff00, 0x0001ffff000100ff, 0x0001ffff00010001, 0x0001ffff00010100,
++    0x0001ffff01ffff00, 0x0001ffff01000001, 0x0001ffff01010000, 0x0001ff00ffffff00,
++    0x0001ff00ffff00ff, 0x0001ff00ffff0001, 0x0001ff00ffff0100, 0x0001ff00ff00ff01,
++    0x0001ff00ff000000, 0x0001ff00ff01ff00, 0x0001ff00ff01ff01, 0x0001ff00ff010001,
++    0x0001ff00ff010100, 0x0001ff0000ff0000, 0x0001ff0000ff0100, 0x0001ff000000ff00,
++    0x0001ff0000000000, 0x0001ff0000000001, 0x0001ff0000000100, 0x0001ff0000010000,
++    0x0001ff0000010001, 0x0001ff0000010101, 0x0001ff0001ff00ff, 0x0001ff0001ff0101,
++    0x0001ff000100ff01, 0x0001ff0001000000, 0x0001ff000101ff00, 0x0001ff0001010001,
++    0x0001ff0001010100, 0x0001ff01ff00ff00, 0x0001ff01ff000001, 0x0001ff01ff000100,
++    0x0001ff0100ffffff, 0x0001ff0100ffff00, 0x0001ff0100ff0001, 0x0001ff0100000000,
++    0x0001ff0100000001, 0x0001ff01000001ff, 0x0001ff010001ffff, 0x0001ff0101ff0000,
++    0x0001ff010100ff00, 0x0001ff0101000001, 0x0001ff0101010000, 0x000100ffff00ff00,
++    0x000100ffff00ff01, 0x000100ffff000000, 0x000100ffff000001, 0x000100ffff000101,
++    0x000100ffff01ff00, 0x000100ffff010001, 0x000100ffff010100, 0x000100ff00ffffff,
++    0x000100ff00ffff01, 0x000100ff00ff0000, 0x000100ff00ff01ff, 0x000100ff00ff0101,
++    0x000100ff0000ff00, 0x000100ff000000ff, 0x000100ff00000000, 0x000100ff00000001,
++    0x000100ff00000100, 0x000100ff00000101, 0x000100ff0001ffff, 0x000100ff0001ff01,
++    0x000100ff00010000, 0x000100ff01ff00ff, 0x000100ff01ff0000, 0x000100ff01ff0100,
++    0x000100ff0100ffff, 0x000100ff0100ff01, 0x000100ff010000ff, 0x000100ff01000000,
++    0x000100ff01000001, 0x000100ff010001ff, 0x000100ff01000101, 0x000100ff0101ff00,
++    0x000100ff010100ff, 0x000100ff01010100, 0x00010000ffff0000, 0x00010000ffff01ff,
++    0x00010000ffff0101, 0x00010000ff00ff00, 0x00010000ff000000, 0x00010000ff000001,
++    0x00010000ff000100, 0x0001000000ff00ff, 0x0001000000ff0000, 0x0001000000ff0001,
++    0x0001000000ff0100, 0x000100000000ffff, 0x000100000000ff00, 0x00010000000000ff,
++    0x0001000000000000, 0x0001000000000001, 0x0001000000000100, 0x000100000001ff00,
++    0x00010000000100ff, 0x0001000000010000, 0x0001000000010001, 0x0001000000010100,
++    0x0001000001ff0001, 0x0001000001ff0100, 0x0001000001ff0101, 0x000100000100ff00,
++    0x0001000001000000, 0x0001000001000001, 0x0001000001000100, 0x0001000001000101,
++    0x000100000101ff01, 0x0001000001010000, 0x0001000001010001, 0x00010000010101ff,
++    0x00010001ffffff01, 0x00010001ffff0100, 0x00010001ff000000, 0x00010001ff01ffff,
++    0x00010001ff010001, 0x00010001ff0101ff, 0x00010001ff010100, 0x0001000100ffffff,
++    0x0001000100ff0000, 0x0001000100ff01ff, 0x0001000100ff0101, 0x000100010000ff00,
++    0x00010001000000ff, 0x0001000100000000, 0x0001000100000001, 0x00010001000001ff,
++    0x0001000100000101, 0x000100010001ffff, 0x0001000100010000, 0x00010001000101ff,
++    0x0001000101ffffff, 0x0001000101ffff01, 0x0001000101ff0000, 0x0001000101ff0101,
++    0x00010001010000ff, 0x0001000101000001, 0x00010001010001ff, 0x0001000101000100,
++    0x000100010101ffff, 0x00010001010100ff, 0x0001000101010001, 0x0001000101010101,
++    0x000101ffff000001, 0x000101ffff000100, 0x000101ffff010000, 0x000101ff00ffff00,
++    0x000101ff0000ff01, 0x000101ff00000000, 0x000101ff00000101, 0x000101ff0001ff00,
++    0x000101ff00010100, 0x000101ff01ff0000, 0x000101ff0100ff00, 0x000101ff010001ff,
++    0x000101ff01010001, 0x00010100ffffff00, 0x00010100ffff00ff, 0x00010100ff00ffff,
++    0x00010100ff000000, 0x00010100ff01ff00, 0x00010100ff0100ff, 0x00010100ff010001,
++    0x00010100ff010100, 0x0001010000ffffff, 0x0001010000ffff00, 0x0001010000ff0000,
++    0x0001010000ff0001, 0x0001010000ff01ff, 0x000101000000ff00, 0x00010100000000ff,
++    0x0001010000000000, 0x0001010000000001, 0x0001010000000100, 0x000101000001ffff,
++    0x0001010000010000, 0x0001010000010101, 0x0001010001ffff01, 0x0001010001ff00ff,
++    0x0001010001ff0101, 0x0001010001000000, 0x000101000101ff00, 0x00010100010100ff,
++    0x0001010001010000, 0x0001010001010100, 0x00010101ff00ff00, 0x00010101ff000001,
++    0x00010101ff0001ff, 0x0001010100ffff00, 0x0001010100ff00ff, 0x0001010100ff0100,
++    0x000101010000ffff, 0x0001010100000000, 0x00010101000001ff, 0x0001010100000101,
++    0x00010101000100ff, 0x0001010100010000, 0x0001010100010100, 0x0001010101ff0001,
++    0x00010101010000ff, 0x00010101010001ff, 0x0001010101000101, 0x0001010101010001,
++    0x01ffffffffffffff, 0x01ffffffffffff01, 0x01ffffffffff01ff, 0x01ffffffffff0101,
++    0x01ffffffff01ffff, 0x01ffffffff01ff01, 0x01ffffffff0101ff, 0x01ffffffff010101,
++    0x01ffffff00ff0000, 0x01ffffff0000ffff, 0x01ffffff0000ff00, 0x01ffffff000000ff,
++    0x01ffffff00000001, 0x01ffffff00000100, 0x01ffffff00010000, 0x01ffffff01ffffff,
++    0x01ffffff01ffff01, 0x01ffffff01ff01ff, 0x01ffffff01ff0101, 0x01ffffff01000000,
++    0x01ffffff0101ffff, 0x01ffffff0101ff01, 0x01ffffff010101ff, 0x01ffffff01010101,
++    0x01ffff00ffff0000, 0x01ffff00ff00ff00, 0x01ffff00ff0000ff, 0x01ffff00ff000001,
++    0x01ffff00ff000100, 0x01ffff00ff010000, 0x01ffff0000ffff00, 0x01ffff0000ff00ff,
++    0x01ffff0000ff0100, 0x01ffff000000ffff, 0x01ffff000000ff01, 0x01ffff0000000000,
++    0x01ffff0000000001, 0x01ffff00000001ff, 0x01ffff0000000100, 0x01ffff00000100ff,
++    0x01ffff0000010001, 0x01ffff0000010100, 0x01ffff0001ff0000, 0x01ffff0001ff0100,
++    0x01ffff00010000ff, 0x01ffff0001000001, 0x01ffff0001000100, 0x01ffff0001010000,
++    0x01ffff01ffffffff, 0x01ffff01ffffff01, 0x01ffff01ffff01ff, 0x01ffff01ffff0101,
++    0x01ffff01ff000000, 0x01ffff01ff01ffff, 0x01ffff01ff01ff01, 0x01ffff01ff0101ff,
++    0x01ffff01ff010101, 0x01ffff010000ff00, 0x01ffff01000000ff, 0x01ffff0100000100,
++    0x01ffff0100010000, 0x01ffff0101ffffff, 0x01ffff0101ffff01, 0x01ffff0101ff01ff,
++    0x01ffff0101ff0101, 0x01ffff0101000000, 0x01ffff010101ffff, 0x01ffff010101ff01,
++    0x01ffff01010101ff, 0x01ffff0101010101, 0x01ff00ffff0000ff, 0x01ff00ffff000100,
++    0x01ff00ff00ffff00, 0x01ff00ff00ff00ff, 0x01ff00ff0000ff00, 0x01ff00ff00000000,
++    0x01ff00ff00000101, 0x01ff00ff0001ff00, 0x01ff00ff000100ff, 0x01ff00ff00010100,
++    0x01ff00ff010000ff, 0x01ff00ff01000100, 0x01ff0000ffffff00, 0x01ff0000ffff0100,
++    0x01ff0000ff00ff01, 0x01ff0000ff000000, 0x01ff0000ff000101, 0x01ff0000ff010001,
++    0x01ff0000ff010100, 0x01ff000000ffffff, 0x01ff000000ffff00, 0x01ff000000ff0000,
++    0x01ff000000ff01ff, 0x01ff00000000ff00, 0x01ff0000000000ff, 0x01ff000000000000,
++    0x01ff000000000001, 0x01ff000000000100, 0x01ff000000000101, 0x01ff000000010000,
++    0x01ff000000010001, 0x01ff0000000101ff, 0x01ff000000010101, 0x01ff000001ffff00,
++    0x01ff000001ff00ff, 0x01ff000001ff0001, 0x01ff000001ff0100, 0x01ff00000100ffff,
++    0x01ff00000100ff01, 0x01ff000001000000, 0x01ff0000010001ff, 0x01ff000001010001,
++    0x01ff0001ff00ff00, 0x01ff0001ff000001, 0x01ff0001ff000100, 0x01ff0001ff010000,
++    0x01ff000100ffff00, 0x01ff000100ff00ff, 0x01ff000100ff0100, 0x01ff000100ff0101,
++    0x01ff00010000ffff, 0x01ff000100000000, 0x01ff000100000100, 0x01ff000100000101,
++    0x01ff00010001ff00, 0x01ff000100010001, 0x01ff000100010101, 0x01ff000101ff0000,
++    0x01ff00010100ff00, 0x01ff000101000101, 0x01ff0001010100ff, 0x01ff01ffffffffff,
++    0x01ff01ffffffff01, 0x01ff01ffffff01ff, 0x01ff01ffffff0101, 0x01ff01ffff000000,
++    0x01ff01ffff01ffff, 0x01ff01ffff01ff01, 0x01ff01ffff0101ff, 0x01ff01ffff010101,
++    0x01ff01ff00ffff00, 0x01ff01ff00ff0000, 0x01ff01ff0000ff00, 0x01ff01ff000000ff,
++    0x01ff01ff00000100, 0x01ff01ff00010000, 0x01ff01ff00010100, 0x01ff01ff01ffffff,
++    0x01ff01ff01ffff01, 0x01ff01ff01ff01ff, 0x01ff01ff01ff0101, 0x01ff01ff01000000,
++    0x01ff01ff0101ffff, 0x01ff01ff0101ff01, 0x01ff01ff010101ff, 0x01ff01ff01010101,
++    0x01ff0100ffff0000, 0x01ff0100ffff0001, 0x01ff0100ff00ff00, 0x01ff0100ff0000ff,
++    0x01ff0100ff000001, 0x01ff0100ff010000, 0x01ff010000ffff00, 0x01ff010000ff00ff,
++    0x01ff010000ff0001, 0x01ff010000ff0100, 0x01ff01000000ffff, 0x01ff01000000ff01,
++    0x01ff010000000000, 0x01ff010000000101, 0x01ff01000001ff00, 0x01ff0100000100ff,
++    0x01ff010001ff0000, 0x01ff010001000001, 0x01ff010001000100, 0x01ff010001010000,
++    0x01ff0101ffffffff, 0x01ff0101ffffff01, 0x01ff0101ffff01ff, 0x01ff0101ffff0101,
++    0x01ff0101ff000000, 0x01ff0101ff01ffff, 0x01ff0101ff01ff01, 0x01ff0101ff0101ff,
++    0x01ff0101ff010101, 0x01ff010100ff0000, 0x01ff01010000ff00, 0x01ff0101000000ff,
++    0x01ff010100000001, 0x01ff010101ffffff, 0x01ff010101ffff01, 0x01ff010101ff01ff,
++    0x01ff010101ff0101, 0x01ff010101000000, 0x01ff01010101ffff, 0x01ff01010101ff01,
++    0x01ff0101010101ff, 0x01ff010101010101, 0x0100ffffffff0000, 0x0100ffffff00ff00,
++    0x0100ffffff000001, 0x0100ffffff0001ff, 0x0100ffffff000100, 0x0100ffffff010000,
++    0x0100ffff00ffff00, 0x0100ffff00ff0001, 0x0100ffff00ff0100, 0x0100ffff00000000,
++    0x0100ffff000001ff, 0x0100ffff00000101, 0x0100ffff00010100, 0x0100ffff00010101,
++    0x0100ffff01ff0000, 0x0100ffff0100ff00, 0x0100ffff010000ff, 0x0100ffff01000001,
++    0x0100ffff01000100, 0x0100ffff01010000, 0x0100ff00ffffff00, 0x0100ff00ffff00ff,
++    0x0100ff00ffff0001, 0x0100ff00ffff0100, 0x0100ff00ff00ffff, 0x0100ff00ff000000,
++    0x0100ff00ff0001ff, 0x0100ff00ff000101, 0x0100ff00ff01ff00, 0x0100ff00ff0100ff,
++    0x0100ff00ff010001, 0x0100ff00ff010100, 0x0100ff0000ffffff, 0x0100ff0000ff0000,
++    0x0100ff000000ffff, 0x0100ff000000ff00, 0x0100ff00000000ff, 0x0100ff0000000000,
++    0x0100ff0000000001, 0x0100ff0000000100, 0x0100ff000001ff01, 0x0100ff0000010000,
++    0x0100ff0001ff00ff, 0x0100ff0001ff0001, 0x0100ff000100ff01, 0x0100ff0001000000,
++    0x0100ff00010001ff, 0x0100ff000101ff00, 0x0100ff00010100ff, 0x0100ff0001010001,
++    0x0100ff0001010100, 0x0100ff01ffff0000, 0x0100ff01ff00ff00, 0x0100ff01ff0000ff,
++    0x0100ff01ff000100, 0x0100ff01ff010000, 0x0100ff0100ff00ff, 0x0100ff0100ff0001,
++    0x0100ff0100ff0100, 0x0100ff010000ffff, 0x0100ff010000ff01, 0x0100ff0100000000,
++    0x0100ff01000001ff, 0x0100ff0100010001, 0x0100ff0100010100, 0x0100ff0101ff0000,
++    0x0100ff01010000ff, 0x0100ff0101000001, 0x0100ff0101010100, 0x010000ffffffff00,
++    0x010000ffffff00ff, 0x010000ffffff0001, 0x010000ffff00ffff, 0x010000ffff000000,
++    0x010000ffff0001ff, 0x010000ffff010001, 0x010000ff00ffffff, 0x010000ff00ff0101,
++    0x010000ff0000ff00, 0x010000ff000000ff, 0x010000ff00000000, 0x010000ff00000001,
++    0x010000ff000001ff, 0x010000ff00000100, 0x010000ff0001ffff, 0x010000ff0001ff00,
++    0x010000ff0001ff01, 0x010000ff00010000, 0x010000ff01ff00ff, 0x010000ff01ff0001,
++    0x010000ff0100ff01, 0x010000ff010000ff, 0x010000ff01000000, 0x010000ff010001ff,
++    0x010000ff0101ff00, 0x010000ff01010100, 0x01000000ffffffff, 0x01000000ffff0000,
++    0x01000000ffff01ff, 0x01000000ffff0101, 0x01000000ff00ffff, 0x01000000ff00ff00,
++    0x01000000ff0000ff, 0x01000000ff000000, 0x01000000ff000001, 0x01000000ff000100,
++    0x01000000ff01ff00, 0x01000000ff010000, 0x01000000ff010100, 0x01000000ff010101,
++    0x0100000000ffff00, 0x0100000000ff00ff, 0x0100000000ff0000, 0x0100000000ff0001,
++    0x0100000000ff0100, 0x010000000000ffff, 0x010000000000ff00, 0x010000000000ff01,
++    0x01000000000000ff, 0x0100000000000000, 0x0100000000000001, 0x01000000000001ff,
++    0x0100000000000100, 0x0100000000000101, 0x010000000001ff00, 0x01000000000100ff,
++    0x0100000000010000, 0x0100000000010001, 0x0100000000010100, 0x0100000001ffff00,
++    0x0100000001ff0000, 0x0100000001ff01ff, 0x010000000100ff00, 0x010000000100ff01,
++    0x01000000010000ff, 0x0100000001000000, 0x0100000001000001, 0x0100000001000100,
++    0x0100000001000101, 0x010000000101ffff, 0x010000000101ff01, 0x0100000001010000,
++    0x01000000010101ff, 0x0100000001010101, 0x01000001ffffff00, 0x01000001ffff00ff,
++    0x01000001ff00ffff, 0x01000001ff000000, 0x01000001ff000100, 0x01000001ff01ffff,
++    0x01000001ff010001, 0x01000001ff010100, 0x0100000100ff0000, 0x0100000100ff01ff,
++    0x0100000100ff0100, 0x010000010000ff00, 0x010000010000ff01, 0x0100000100000000,
++    0x0100000100000001, 0x0100000100000100, 0x0100000100010000, 0x01000001000101ff,
++    0x0100000101ffff01, 0x0100000101ff00ff, 0x0100000101ff0100, 0x0100000101ff0101,
++    0x010000010100ff01, 0x01000001010000ff, 0x0100000101000000, 0x01000001010100ff,
++    0x0100000101010001, 0x0100000101010100, 0x010001ffffff0000, 0x010001ffff000001,
++    0x010001ffff000100, 0x010001ffff010000, 0x010001ff00ffff00, 0x010001ff00ff0001,
++    0x010001ff0000ffff, 0x010001ff0000ff01, 0x010001ff00000000, 0x010001ff00000001,
++    0x010001ff00000101, 0x010001ff000100ff, 0x010001ff00010000, 0x010001ff01ff0000,
++    0x010001ff0100ff00, 0x010001ff01000001, 0x010001ff01000100, 0x010001ff01010000,
++    0x01000100ffff00ff, 0x01000100ffff0001, 0x01000100ffff0100, 0x01000100ff00ffff,
++    0x01000100ff00ff01, 0x01000100ff000000, 0x01000100ff0001ff, 0x01000100ff000101,
++    0x01000100ff01ffff, 0x01000100ff01ff00, 0x01000100ff0100ff, 0x01000100ff010001,
++    0x0100010000ffffff, 0x0100010000ffff01, 0x0100010000ff0000, 0x0100010000ff01ff,
++    0x0100010000ff0101, 0x010001000000ff00, 0x01000100000000ff, 0x0100010000000000,
++    0x0100010000000001, 0x0100010000000100, 0x010001000001ff01, 0x0100010000010000,
++    0x0100010000010001, 0x0100010000010101, 0x0100010001ffff00, 0x0100010001ff00ff,
++    0x010001000100ffff, 0x010001000100ff01, 0x0100010001000000, 0x0100010001000101,
++    0x010001000101ff00, 0x0100010001010001, 0x01000101ffff0000, 0x01000101ff000000,
++    0x01000101ff010000, 0x0100010100ff00ff, 0x0100010100ff0001, 0x0100010100ff0100,
++    0x010001010000ffff, 0x0100010100000000, 0x01000101000001ff, 0x010001010001ff00,
++    0x0100010101ff0000, 0x010001010100ff00, 0x01000101010000ff, 0x0100010101000000,
++    0x0100010101000001, 0x0101ffffffffffff, 0x0101ffffffffff01, 0x0101ffffffff01ff,
++    0x0101ffffffff0101, 0x0101ffffff000000, 0x0101ffffff01ffff, 0x0101ffffff01ff01,
++    0x0101ffffff0101ff, 0x0101ffffff010101, 0x0101ffff00ff0000, 0x0101ffff0000ff00,
++    0x0101ffff000000ff, 0x0101ffff00000001, 0x0101ffff00000100, 0x0101ffff01ffffff,
++    0x0101ffff01ffff01, 0x0101ffff01ff01ff, 0x0101ffff01ff0101, 0x0101ffff01000000,
++    0x0101ffff0101ffff, 0x0101ffff0101ff01, 0x0101ffff010101ff, 0x0101ffff01010101,
++    0x0101ff00ffff0000, 0x0101ff00ffff0100, 0x0101ff00ff00ff00, 0x0101ff00ff0000ff,
++    0x0101ff00ff000001, 0x0101ff00ff000100, 0x0101ff00ff000101, 0x0101ff0000ff0001,
++    0x0101ff0000ff0100, 0x0101ff000000ff00, 0x0101ff0000000000, 0x0101ff00000001ff,
++    0x0101ff0000000101, 0x0101ff000001ff00, 0x0101ff00000100ff, 0x0101ff0001ff0000,
++    0x0101ff000100ffff, 0x0101ff000100ff01, 0x0101ff0001000001, 0x0101ff0001000100,
++    0x0101ff01ffffff01, 0x0101ff01ffff01ff, 0x0101ff01ffff0101, 0x0101ff01ff00ffff,
++    0x0101ff01ff000100, 0x0101ff01ff01ff01, 0x0101ff01ff0101ff, 0x0101ff01ff010101,
++    0x0101ff0100ff0000, 0x0101ff010000ff00, 0x0101ff0100000001, 0x0101ff0100000100,
++    0x0101ff0100010000, 0x0101ff0101ffffff, 0x0101ff0101ffff01, 0x0101ff0101ff01ff,
++    0x0101ff0101ff0101, 0x0101ff0101000000, 0x0101ff010101ffff, 0x0101ff010101ff01,
++    0x0101ff01010101ff, 0x0101ff0101010101, 0x010100ffff000100, 0x010100ffff010000,
++    0x010100ff00ffff00, 0x010100ff00ff00ff, 0x010100ff0000ffff, 0x010100ff000000ff,
++    0x010100ff00000000, 0x010100ff000001ff, 0x010100ff00000101, 0x010100ff0001ff00,
++    0x010100ff00010000, 0x010100ff00010001, 0x010100ff000101ff, 0x010100ff00010100,
++    0x010100ff01ff0000, 0x01010000ffff0001, 0x01010000ffff0100, 0x01010000ff00ffff,
++    0x01010000ff00ff01, 0x01010000ff000000, 0x01010000ff0001ff, 0x01010000ff010001,
++    0x01010000ff010100, 0x0101000000ffff01, 0x0101000000ff0000, 0x010100000000ff00,
++    0x01010000000000ff, 0x0101000000000000, 0x0101000000000001, 0x0101000000000100,
++    0x0101000000010000, 0x0101000000010101, 0x0101000001ffff00, 0x0101000001ff00ff,
++    0x0101000001ff0000, 0x0101000001ff0001, 0x0101000001ff0100, 0x010100000100ff01,
++    0x0101000001000000, 0x01010000010001ff, 0x01010001ffff0000, 0x01010001ff00ff00,
++    0x01010001ff000001, 0x01010001ff000101, 0x01010001ff01ff00, 0x01010001ff010000,
++    0x0101000100ff00ff, 0x0101000100ff0001, 0x0101000100ff0101, 0x010100010000ff01,
++    0x0101000100000000, 0x0101000100000001, 0x01010001000001ff, 0x010100010001ffff,
++    0x010100010001ff01, 0x0101000101ff0001, 0x010100010100ffff, 0x0101000101000000,
++    0x0101000101000001, 0x0101000101000100, 0x010100010101ff00, 0x01010001010100ff,
++    0x0101000101010001, 0x010101ffffffffff, 0x010101ffffffff01, 0x010101ffffff01ff,
++    0x010101ffffff0101, 0x010101ffff01ffff, 0x010101ffff01ff01, 0x010101ffff0101ff,
++    0x010101ffff010101, 0x010101ff0000ff00, 0x010101ff000000ff, 0x010101ff00000001,
++    0x010101ff00000100, 0x010101ff01ffffff, 0x010101ff01ffff01, 0x010101ff01ff01ff,
++    0x010101ff01ff0101, 0x010101ff01000000, 0x010101ff0101ffff, 0x010101ff0101ff01,
++    0x010101ff010101ff, 0x010101ff01010101, 0x01010100ffff0000, 0x01010100ff0000ff,
++    0x01010100ff000100, 0x01010100ff01ff00, 0x01010100ff010000, 0x0101010000ffff00,
++    0x010101000000ffff, 0x0101010000000000, 0x0101010000000101, 0x010101000001ff00,
++    0x0101010000010001, 0x0101010000010100, 0x010101000100ffff, 0x0101010001000001,
++    0x01010101ffffffff, 0x01010101ffffff01, 0x01010101ffff01ff, 0x01010101ffff0101,
++    0x01010101ff01ffff, 0x01010101ff01ff01, 0x01010101ff0101ff, 0x01010101ff010101,
++    0x010101010000ff00, 0x01010101000000ff, 0x0101010100000001, 0x0101010101ffffff,
++    0x0101010101ffff01, 0x0101010101ff01ff, 0x0101010101ff0101, 0x0101010101000000,
++    0x010101010101ffff, 0x010101010101ff01, 0x01010101010101ff, 0x0101010101010101,
++};
+diff --git a/ggml/src/ggml-cpu/llamafile/kquants_ppc_mma.h b/ggml/src/ggml-cpu/llamafile/kquants_ppc_mma.h
+index fd539d5..d5a624c 100644
+--- a/ggml/src/ggml-cpu/llamafile/kquants_ppc_mma.h
++++ b/ggml/src/ggml-cpu/llamafile/kquants_ppc_mma.h
+@@ -36,6 +36,24 @@ void gemm_q5_0_q8_0_ppc(int64_t m, int64_t n, int64_t k,
+ void gemm_q5_1_q8_1_ppc(int64_t m, int64_t n, int64_t k,
+         const void * A, int64_t lda, const void * B, int64_t ldb,
+         float * C, int64_t ldc, int ith, int nth);
++void gemm_tq2_0_q8_K_ppc(int64_t m, int64_t n, int64_t k,
++        const void * A, int64_t lda, const void * B, int64_t ldb,
++        float * C, int64_t ldc, int ith, int nth);
++void gemm_tq1_0_q8_K_ppc(int64_t m, int64_t n, int64_t k,
++        const void * A, int64_t lda, const void * B, int64_t ldb,
++        float * C, int64_t ldc, int ith, int nth);
++void gemm_iq2_xxs_q8_K_ppc(int64_t m, int64_t n, int64_t k,
++        const void * A, int64_t lda, const void * B, int64_t ldb,
++        float * C, int64_t ldc, int ith, int nth);
++void gemm_iq3_xxs_q8_K_ppc(int64_t m, int64_t n, int64_t k,
++        const void * A, int64_t lda, const void * B, int64_t ldb,
++        float * C, int64_t ldc, int ith, int nth);
++void gemm_iq3_s_q8_K_ppc(int64_t m, int64_t n, int64_t k,
++        const void * A, int64_t lda, const void * B, int64_t ldb,
++        float * C, int64_t ldc, int ith, int nth);
++void gemm_iq1_s_q8_K_ppc(int64_t m, int64_t n, int64_t k,
++        const void * A, int64_t lda, const void * B, int64_t ldb,
++        float * C, int64_t ldc, int ith, int nth);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml-cpu/llamafile/sgemm.cpp b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+index 6c8fe3b..57cb23a 100644
+--- a/ggml/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -4060,6 +4060,78 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+ #endif
+     }
+ 
++    case GGML_TYPE_TQ2_0: {
++        if (Btype != GGML_TYPE_Q8_K)
++            return false;
++#if defined(__MMA__)
++        gemm_tq2_0_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
++            (float *)C, ldc, params->ith, params->nth);
++        return true;
++#else
++        return false;
++#endif
++    }
++
++    case GGML_TYPE_TQ1_0: {
++        if (Btype != GGML_TYPE_Q8_K)
++            return false;
++#if defined(__MMA__)
++        gemm_tq1_0_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
++            (float *)C, ldc, params->ith, params->nth);
++        return true;
++#else
++        return false;
++#endif
++    }
++
++    case GGML_TYPE_IQ2_XXS: {
++        if (Btype != GGML_TYPE_Q8_K)
++            return false;
++#if defined(__MMA__)
++        gemm_iq2_xxs_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
++            (float *)C, ldc, params->ith, params->nth);
++        return true;
++#else
++        return false;
++#endif
++    }
++
++    case GGML_TYPE_IQ3_XXS: {
++        if (Btype != GGML_TYPE_Q8_K)
++            return false;
++#if defined(__MMA__)
++        gemm_iq3_xxs_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
++            (float *)C, ldc, params->ith, params->nth);
++        return true;
++#else
++        return false;
++#endif
++    }
++
++    case GGML_TYPE_IQ3_S: {
++        if (Btype != GGML_TYPE_Q8_K)
++            return false;
++#if defined(__MMA__)
++        gemm_iq3_s_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
++            (float *)C, ldc, params->ith, params->nth);
++        return true;
++#else
++        return false;
++#endif
++    }
++
++    case GGML_TYPE_IQ1_S: {
++        if (Btype != GGML_TYPE_Q8_K)
++            return false;
++#if defined(__MMA__)
++        gemm_iq1_s_q8_K_ppc(m, n, k * QK_K, A, lda, B, ldb,
++            (float *)C, ldc, params->ith, params->nth);
++        return true;
++#else
++        return false;
++#endif
++    }
++
+     case GGML_TYPE_Q1_0: {
+         if (Btype != GGML_TYPE_Q8_0)
+             return false;

@@ -25,6 +25,7 @@ dominate compute. These kernels close that gap.
 | `src/q2_k_ppc_mma.cpp` | `Q2_K` × `Q8_K`: 16-deep chunks, per-16 scale+min pairs |
 | `src/q3_k_ppc_mma.cpp` | `Q3_K` × `Q8_K`: 16-deep chunks; q′ = code∣(hbit≪2), offset correction folded (TS = 4·dB·bsums) |
 | `src/legacy_ppc_mma.cpp` | `Q4_1`/`Q5_1` × `Q8_1` (min term = one FMA using Q8_1's precomputed `s`), `Q5_0` × `Q8_0` (folded offset) |
+| `src/iq_grid_ppc_mma.cpp` | `TQ1_0`/`TQ2_0` (BitNet ternary), `IQ2_XXS`, `IQ3_XXS`, `IQ3_S`, `IQ1_S` × `Q8_K`: decode-at-repack to signed int8 + one shared signed 8×8 kernel |
 | `src/iq4_ppc_mma.cpp` | `IQ4_NL` × `Q8_0` and `IQ4_XS` × `Q8_K`: signed 16-entry codebook via one `vec_perm`, v2-orientation with pre-folded −128·W correction, 8×8/4-acc |
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the derivation and the

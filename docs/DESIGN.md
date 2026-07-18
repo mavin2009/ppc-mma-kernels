@@ -176,6 +176,20 @@ whose block stores s = dB·Σy precomputed by ggml's quantizer, so the
 min term reduces to `fin += mA · s` — one vec_madd with no sum computed
 anywhere in this project's code.
 
+**Grid codebooks and ggml ternary: decode-at-repack.** The packed-API
+architecture makes exotic formats cheap to support: weight decode runs
+once at repack, so TQ2_0/TQ1_0 (BitNet, incl. the base-243 digit
+extraction), IQ2_XXS/IQ3_XXS/IQ3_S (grid tables + sign masks) and
+IQ1_S all reduce to "signed int8 codes + one scale per 32-chunk" and
+share a single signed-operand 8×8 kernel. IQ1_S's fractional delta is
+made exact with codes = 8·g ± 1 and scale = dl/8. The decoders are
+direct scalar ports of ggml's dequantize_row semantics; note the test
+references run *through the same decoders* (they verify GEMM/pack
+consistency, not decoder-vs-ggml — the temperature-0 check in
+DEPLOY.md is the decoder's independent verification). Still deferred:
+IQ2_XS, IQ2_S, IQ1_M, whose per-16 scales need a 16-deep signed-chunk
+kernel variant.
+
 **Register-pressure note (K-quants).** Static analysis of the K-quant
 hot loops shows ~50–85 stack vector ops per chunk iteration, versus
 ~0–8 for v3. This is structural, not a codegen accident: the fixup
