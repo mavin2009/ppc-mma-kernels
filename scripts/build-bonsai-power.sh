@@ -8,10 +8,11 @@
 # Cross + qemu development loop (x86 host):
 #   CROSS=1 ./scripts/build-bonsai-power.sh
 #
-# The patch was generated against fork commit
-# 79697f23a2c8f3aa2ccb2fd7406095a8dbfbb454 (branch `prism`); if the fork
-# has moved and a patch no longer applies cleanly, pin that commit or
-# rebase the patch (it touches 2 files and adds 2).
+# The patch series (patches/0001..0009) was generated against fork commit
+# 79697f23a2c8f3aa2ccb2fd7406095a8dbfbb454 (branch `prism`) and is gated:
+# sequential application on that commit reproduces the build-verified
+# tree byte-for-byte. If the fork moves and a patch stops applying,
+# stay on the pinned commit (the default here) or rebase the series.
 set -e
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -48,7 +49,10 @@ else
 fi
 
 cmake -B build $EXTRA -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF
-cmake --build build -j"$(nproc)" --target llama-cli llama-server llama-bench
+# JOBS: override for memory-constrained guests (LPARs/VMs); each C++
+# job can peak >1 GB, so default to min(nproc, RAM_GB/1.5) heuristics
+# being unavailable in sh, we simply honor an explicit JOBS if set.
+cmake --build build -j"${JOBS:-$(nproc)}" --target llama-cli llama-server llama-bench
 
 echo
 echo "Built: $PWD/build/bin/{llama-cli,llama-server,llama-bench}"

@@ -17,6 +17,7 @@ RHEL: `dnf install git cmake gcc-c++ make` · Ubuntu: `apt install git cmake g++
 git clone https://github.com/mavin2009/ppc-mma-kernels
 cd ppc-mma-kernels
 ./scripts/build-bonsai-power.sh
+# memory- or core-constrained guest?  JOBS=2 ./scripts/build-bonsai-power.sh
 ```
 
 The script clones the PrismML llama.cpp fork at the pinned commit the
