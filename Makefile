@@ -40,7 +40,7 @@ PROD_TESTS := \
 	$(BUILD)/qbit_test \
 	$(BUILD)/q2_k_test $(BUILD)/q3_k_test $(BUILD)/q4_k_test \
 	$(BUILD)/q5_k_test $(BUILD)/q6_k_test \
-	$(BUILD)/iq4_test $(BUILD)/legacy_test $(BUILD)/iq_grid_test
+	$(BUILD)/iq4_test $(BUILD)/legacy_test $(BUILD)/iq_grid_test $(BUILD)/iq_grid_pp_test
 
 # ---- reference (design-history) suites ----
 REF_TESTS := \
@@ -81,6 +81,10 @@ $(BUILD)/legacy_test: src/legacy_ppc_mma.cpp | $(BUILD)
 
 $(BUILD)/iq_grid_test: src/iq_grid_ppc_mma.cpp src/iq_grids.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -DIQGRID_TEST $< -o $@
+
+# accumulator ping-pong variant (hardware experiment #1; see BENCHMARKS-QEMU.md)
+$(BUILD)/iq_grid_pp_test: src/iq_grid_ppc_mma.cpp src/iq_grids.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -DIQGRID_TEST -DIQGRID_PINGPONG $< -o $@
 
 $(BUILD)/qbit_bench: src/qbit_ppc_mma_v4.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) -DQBIT4_BENCH $< -o $@

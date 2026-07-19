@@ -78,3 +78,29 @@ Per 2048-element-slab chunk iteration of the compiled signed kernels
 These ratios bound how much of the machine's MMA throughput each
 kernel family can expose and are the primary hypotheses to test on
 silicon.
+
+## Hardware experiment #1: accumulator ping-pong
+
+Power10's accumulators are physically resident in the MMA engine;
+`xxmfacc` drains engine state to the VRF and serializes against that
+accumulator's GER stream. The default kernels therefore idle the
+engine through every per-chunk fixup (~4 serialized drains + 48 VSU
+ops). Build the 32-deep signed kernel with `-DIQGRID_PINGPONG` to run
+two 4-accumulator sets in alternation, issuing chunk c+1's GERs before
+draining chunk c.
+
+Static price, measured (per chunk): 284 vs 276 instructions, 38 vs 28
+stores (8-accumulator aliasing spill), loads and GERs identical.
+Predicted silicon effect: engine-idle removal worth far more than the
++3% instruction cost *if* the engine is the bottleneck — which is
+precisely what an instruction-count proxy cannot see. Both variants
+are correctness-tested in `make test`; `scripts/validate-on-power.sh`
+run against both builds is the arbiter.
+
+## Thread placement on silicon
+
+Each Power10 SMT8 core carries two MMA engines, one per SMT4 slice.
+For GEMM-bound phases (prompt processing), more than one thread per
+SMT4 slice shares an engine; start tuning at one thread per slice.
+The bandwidth-bound GEMV path (token generation) typically wants more
+threads than engines. `llama-bench -t` sweeps settle this per machine.
