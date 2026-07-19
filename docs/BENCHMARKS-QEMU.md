@@ -93,9 +93,10 @@ Static price, measured (per chunk): 284 vs 276 instructions, 38 vs 28
 stores (8-accumulator aliasing spill), loads and GERs identical.
 Predicted silicon effect: engine-idle removal worth far more than the
 +3% instruction cost *if* the engine is the bottleneck — which is
-precisely what an instruction-count proxy cannot see. Both variants
-are correctness-tested in `make test`; `scripts/validate-on-power.sh`
-run against both builds is the arbiter.
+precisely what an instruction-count proxy cannot see. Both variants are correctness-tested in `make test`. In the fork,
+patch 0010 carries the same flag: rebuild with
+`-DCMAKE_CXX_FLAGS="-mcpu=power10 -DIQGRID_PINGPONG"` and run
+`scripts/validate-on-power.sh` against both builds to arbitrate.
 
 ## Thread placement on silicon
 

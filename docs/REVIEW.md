@@ -18,7 +18,7 @@ that has never found a defect in itself hasn't looked.
 | Allocation-failure behavior (in-tree drivers) | `GGML_ABORT` instead of silent skip | Fixed (patch 0006) |
 | Out-of-bounds loads at block-array tails | Manual audit of every load against struct extents; one real OOB found and fixed in the v1 kernels | Audited |
 | Integer overflow in GER accumulation | Bounds analysis: max chunk dot ≪ 2³¹ for every format | Verified by analysis |
-| Patch-series integrity (0001–0009) | Sequential `git apply` gate on a pristine checkout of the pinned base; result diffed against the build-verified tree | Verified, byte-identical |
+| Patch-series integrity (0001–0010) | Sequential `git apply` gate on a pristine checkout of the pinned base; result diffed against the build-verified tree | Verified, byte-identical |
 | Fork integration compiles + links | ppc64le cross-build, GCC 14, all 10 kernel TUs in ggml-cpu; `llama-cli` executes under qemu | Verified |
 | End-to-end inference numerics through patched dispatch | Requires model weights + hardware | **NOT verified** — DEPLOY.md step 5 is mandatory before production |
 | Grid/ternary/codebook decoders vs ggml's dequantization | Test refs share the decoders (consistency only); decoders are line-by-line ports | **NOT independently verified** — covered by the same step 5 |

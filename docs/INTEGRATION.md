@@ -17,7 +17,9 @@ v4 packed API with no-packing GEMV for n == 1),
 `0008-power-mma-rollout-hardening.patch` (cache admission policy,
 content fingerprinting, column-partitioned activation packing),
 `0009-power-mma-prefetch.patch` (full-cacheline prefetch of packed
-panels,
+panels),
+`0010-power-mma-pingpong-variant.patch` (compile-flag accumulator
+ping-pong for hardware arbitration,
 with a one-shot driver that packs the calling thread's row tiles per
 call -- correct but not the final performance shape; the load-time
 repack.cpp integration is the follow-up). All are applied
