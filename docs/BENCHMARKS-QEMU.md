@@ -52,18 +52,18 @@ CI budgeting:
 
 | suite | formats | qemu wall |
 |---|---|---|
-| qbit_test | Q1_0, Q2_0 | 0.39 s |
-| q2_k_test | Q2_K | 1.58 s |
-| q3_k_test | Q3_K | 1.21 s |
-| q4_k_test | Q4_K | 0.18 s |
-| q5_k_test | Q5_K | 0.20 s |
-| q6_k_test | Q6_K | 1.05 s |
-| iq4_test | IQ4_NL, IQ4_XS, MXFP4 | 0.32 s |
-| legacy_test | Q4_1, Q5_0, Q5_1 | 5.23 s |
-| iq_grid_test | TQ1_0/TQ2_0, IQ2/IQ3 grids, IQ1_S/M, NVFP4 | 1.04 s |
+| qbit_test | Q1_0, Q2_0 | 0.62 s |
+| q2_k_test | Q2_K | 1.57 s |
+| q3_k_test | Q3_K | 1.23 s |
+| q4_k_test | Q4_K | 0.19 s |
+| q5_k_test | Q5_K | 0.21 s |
+| q6_k_test | Q6_K | 1.08 s |
+| iq4_test | IQ4_NL, IQ4_XS, MXFP4, Q8_0 | 0.39 s |
+| legacy_test | Q4_1, Q5_0, Q5_1, Q4_0 | 5.90 s |
+| iq_grid_test | TQ1/TQ2, IQ2/IQ3 grids, IQ1_S/M, NVFP4 | 1.00 s |
+| iq_grid_pp_test | same, ping-pong kernel | 1.00 s |
 
-(≈12 s total for the whole production matrix — cheap enough to run on
-every commit.)
+(≈13 s total for the full production matrix, ping-pong variant included — re-measured after patch 0011 folded Q8_0 into iq4_test and Q4_0 into legacy_test.)
 
 ## Static instruction accounting (compiler-level, exact)
 
