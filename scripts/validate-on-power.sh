@@ -42,23 +42,23 @@ run_gen() {   # $1 = build dir, $2 = output file, $3 = server log
         sleep 2
     done
     if [ $up -ne 1 ]; then echo "server failed to start ($1); see $3"; kill $SPID 2>/dev/null; exit 1; fi
-    curl -s "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json'         -d "{\"prompt\": \"$PROMPT\", \"n_predict\": 32, \"temperature\": 0, \"seed\": 42, \"cache_prompt\": false}"         | python3 -c 'import json,sys; print(json.load(sys.stdin).get("content",""))' > "$2"
+    curl -s --connect-timeout 5 --max-time 1800 "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json'         -d "{\"prompt\": \"$PROMPT\", \"n_predict\": 32, \"temperature\": 0, \"seed\": 42, \"cache_prompt\": false}"         | python3 -c 'import json,sys; print(json.load(sys.stdin).get("content",""))' > "$2"
     kill $SPID 2>/dev/null; wait $SPID 2>/dev/null
 }
 
-echo "== building MMA (native) variant"
+echo "[$(date +%H:%M:%S)] == building MMA (native) variant"
 cmake -B build-mma -DGGML_NATIVE=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF > /dev/null
 cmake --build build-mma -j"${JOBS:-$(nproc)}" --target llama-server llama-bench > /dev/null
 
-echo "== building no-MMA reference (-mcpu=power9)"
+echo "[$(date +%H:%M:%S)] == building no-MMA reference (-mcpu=power9)"
 cmake -B build-ref -DGGML_NATIVE=OFF -DCMAKE_C_FLAGS=-mcpu=power9 -DCMAKE_CXX_FLAGS=-mcpu=power9       -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF > /dev/null
 cmake --build build-ref -j"${JOBS:-$(nproc)}" --target llama-server llama-bench > /dev/null
 
-echo "== temperature-0 comparison (via llama-server; ~a minute per side plus load)"
+echo "[$(date +%H:%M:%S)] == temperature-0 comparison (two server starts + model loads; the scalar side is deliberately slow -- minutes each, not hung)"
 run_gen build-mma /tmp/out-mma.txt /tmp/server-mma.log
 run_gen build-ref /tmp/out-ref.txt /tmp/server-ref.log
 
-echo "== MMA active in native build:"
+echo "[$(date +%H:%M:%S)] == MMA active in native build:"
 grep -o "MMA = [01]" /tmp/server-mma.log | head -1 || echo "MMA flag not found in server banner; check /tmp/server-mma.log"
 
 if diff -q /tmp/out-mma.txt /tmp/out-ref.txt > /dev/null; then
@@ -68,7 +68,7 @@ else
 fi
 echo "$T0"
 
-echo "== llama-bench (this takes a few minutes)"
+echo "[$(date +%H:%M:%S)] == llama-bench (this takes a few minutes)"
 BM=$(build-mma/bin/llama-bench -m "$MODEL" 2>/dev/null | tail -8)
 BR=$(build-ref/bin/llama-bench -m "$MODEL" 2>/dev/null | tail -8)
 
