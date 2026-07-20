@@ -69,8 +69,15 @@ fi
 echo "$T0"
 
 echo "[$(date +%H:%M:%S)] == llama-bench (this takes a few minutes)"
-BM=$(build-mma/bin/llama-bench -m "$MODEL" 2>/dev/null | tail -8)
-BR=$(build-ref/bin/llama-bench -m "$MODEL" 2>/dev/null | tail -8)
+# llama-bench defaults to a physical-core heuristic (often 4 on
+# ppc64le SMT topologies). Sweep a ladder instead: Power10 has one MMA
+# engine per SMT4 slice, so the GEMM sweet spot is near slice count
+# while bandwidth-bound generation often wants more threads.
+NP=$(nproc)
+TL="$((NP/4 > 0 ? NP/4 : 1)),$((NP/2 > 0 ? NP/2 : 1)),$NP"
+echo "   thread ladder: -t $TL (nproc=$NP)"
+BM=$(build-mma/bin/llama-bench -m "$MODEL" -t "$TL" 2>/dev/null | tail -14)
+BR=$(build-ref/bin/llama-bench -m "$MODEL" -t "$TL" 2>/dev/null | tail -14)
 
 cat > "$REPO_DIR/validation-report.md" << REPORT
 # Hardware validation report
