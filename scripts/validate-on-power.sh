@@ -76,8 +76,8 @@ echo "[$(date +%H:%M:%S)] == llama-bench (this takes a few minutes)"
 NP=$(nproc)
 TL="$((NP/4 > 0 ? NP/4 : 1)),$((NP/2 > 0 ? NP/2 : 1)),$NP"
 echo "   thread ladder: -t $TL (nproc=$NP)"
-BM=$(build-mma/bin/llama-bench -m "$MODEL" -t "$TL" 2>/dev/null | tail -14)
-BR=$(build-ref/bin/llama-bench -m "$MODEL" -t "$TL" 2>/dev/null | tail -14)
+BM=$(build-mma/bin/llama-bench -m "$MODEL" -t "$TL" -p 128 -n 32 -r 2 2>/dev/null | tail -14)
+BR=$(build-ref/bin/llama-bench -m "$MODEL" -t "$TL" -p 128 -n 32 -r 2 2>/dev/null | tail -14)
 
 cat > "$REPO_DIR/validation-report.md" << REPORT
 # Hardware validation report
