@@ -52,7 +52,7 @@ eval timeout -k 5 900 build-ref/bin/llama-cli $COMMON  < /dev/null 2>/dev/null >
 # blank lines) so interactive junk cannot fake a divergence
 for f in /tmp/out-mma.txt /tmp/out-ref.txt; do
     sed -e 's/\r//g' -e '/^>[[:space:]]*$/d' -e 's/[[:space:]]*$//' "$f" \
-        | awk 'NF{p=1} p' > "$f.clean" && mv "$f.clean" "$f"
+        | awk 'NF{p=1} p' | tac | awk 'NF{p=1} p' | tac > "$f.clean" && mv "$f.clean" "$f"
 done
 if diff -q /tmp/out-mma.txt /tmp/out-ref.txt > /dev/null; then
     T0="**PASS** — MMA and scalar outputs are token-identical"
