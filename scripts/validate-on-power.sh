@@ -28,7 +28,7 @@ SRC="$WORK/llama.cpp"
 cd "$SRC"
 
 PROMPT="The three most important properties of a matrix multiplication kernel are"
-COMMON="-m $MODEL -p \"$PROMPT\" -n 64 --temp 0 --seed 42 --no-display-prompt"
+COMMON="-m $MODEL -p \"$PROMPT\" -n 64 --temp 0 --seed 42 --no-display-prompt -no-cnv"
 
 echo "== building MMA (native) variant"
 cmake -B build-mma -DGGML_NATIVE=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF > /dev/null
@@ -40,11 +40,11 @@ cmake -B build-ref -DGGML_NATIVE=OFF -DCMAKE_C_FLAGS=-mcpu=power9 -DCMAKE_CXX_FL
 cmake --build build-ref -j"${JOBS:-$(nproc)}" --target llama-cli llama-bench > /dev/null
 
 echo "== confirming MMA is active in the native build"
-build-mma/bin/llama-cli -m "$MODEL" -p "x" -n 1 --temp 0 2>&1 | grep -o "MMA = [01]" | head -1 || true
+build-mma/bin/llama-cli -m "$MODEL" -p "x" -n 1 --temp 0 -no-cnv < /dev/null 2>&1 | grep -o "MMA = [01]" | head -1 || true
 
 echo "== temperature-0 comparison"
-eval build-mma/bin/llama-cli $COMMON  2>/dev/null > /tmp/out-mma.txt
-eval build-ref/bin/llama-cli $COMMON  2>/dev/null > /tmp/out-ref.txt
+eval build-mma/bin/llama-cli $COMMON  < /dev/null 2>/dev/null > /tmp/out-mma.txt
+eval build-ref/bin/llama-cli $COMMON  < /dev/null 2>/dev/null > /tmp/out-ref.txt
 if diff -q /tmp/out-mma.txt /tmp/out-ref.txt > /dev/null; then
     T0="**PASS** — MMA and scalar outputs are token-identical"
 else
