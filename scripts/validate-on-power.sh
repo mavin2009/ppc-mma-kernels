@@ -28,36 +28,43 @@ SRC="$WORK/llama.cpp"
 cd "$SRC"
 
 PROMPT="The three most important properties of a matrix multiplication kernel are"
-COMMON="-m $MODEL -p \"$PROMPT\" -n 32 --temp 0 --seed 42 --no-display-prompt -no-cnv"
+PORT=8971
+
+# generate 32 greedy tokens via llama-server + curl: no TTY, no stdin,
+# no conversation mode -- llama-cli's interactive behavior defeated
+# three prior attempts at scripting it (see git log of this file).
+run_gen() {   # $1 = build dir, $2 = output file, $3 = server log
+    "$1/bin/llama-server" -m "$MODEL" --port $PORT --host 127.0.0.1         > "$3" 2>&1 &
+    SPID=$!
+    up=0
+    for i in $(seq 1 120); do
+        if curl -s "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q ok; then up=1; break; fi
+        sleep 2
+    done
+    if [ $up -ne 1 ]; then echo "server failed to start ($1); see $3"; kill $SPID 2>/dev/null; exit 1; fi
+    curl -s "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json'         -d "{\"prompt\": \"$PROMPT\", \"n_predict\": 32, \"temperature\": 0, \"seed\": 42, \"cache_prompt\": false}"         | python3 -c 'import json,sys; print(json.load(sys.stdin).get("content",""))' > "$2"
+    kill $SPID 2>/dev/null; wait $SPID 2>/dev/null
+}
 
 echo "== building MMA (native) variant"
 cmake -B build-mma -DGGML_NATIVE=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF > /dev/null
-cmake --build build-mma -j"${JOBS:-$(nproc)}" --target llama-cli llama-bench > /dev/null
+cmake --build build-mma -j"${JOBS:-$(nproc)}" --target llama-server llama-bench > /dev/null
 
 echo "== building no-MMA reference (-mcpu=power9)"
-cmake -B build-ref -DGGML_NATIVE=OFF -DCMAKE_C_FLAGS=-mcpu=power9 -DCMAKE_CXX_FLAGS=-mcpu=power9 \
-      -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF > /dev/null
-cmake --build build-ref -j"${JOBS:-$(nproc)}" --target llama-cli llama-bench > /dev/null
+cmake -B build-ref -DGGML_NATIVE=OFF -DCMAKE_C_FLAGS=-mcpu=power9 -DCMAKE_CXX_FLAGS=-mcpu=power9       -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF > /dev/null
+cmake --build build-ref -j"${JOBS:-$(nproc)}" --target llama-server llama-bench > /dev/null
 
-echo "== confirming MMA is active in the native build"
-timeout -k 5 180 build-mma/bin/llama-cli -m "$MODEL" -p "x" -n 1 --temp 0 -no-cnv < /dev/null 2>&1 | grep -o "MMA = [01]" | head -1 || true
+echo "== temperature-0 comparison (via llama-server; ~a minute per side plus load)"
+run_gen build-mma /tmp/out-mma.txt /tmp/server-mma.log
+run_gen build-ref /tmp/out-ref.txt /tmp/server-ref.log
 
-echo "== temperature-0 comparison"
-# hard timeout: some llama-cli builds enter a conversation loop after
-# generation and spin on EOF; the tokens are already in the file when
-# the timeout fires, so a killed run is still a valid sample.
-eval timeout -k 5 900 build-mma/bin/llama-cli $COMMON  < /dev/null 2>/dev/null > /tmp/out-mma.txt || true
-eval timeout -k 5 900 build-ref/bin/llama-cli $COMMON  < /dev/null 2>/dev/null > /tmp/out-ref.txt || true
-# scrub conversation-mode residue (bare "> " prompts, CRs, trailing
-# blank lines) so interactive junk cannot fake a divergence
-for f in /tmp/out-mma.txt /tmp/out-ref.txt; do
-    sed -e 's/\r//g' -e '/^>[[:space:]]*$/d' -e 's/[[:space:]]*$//' "$f" \
-        | awk 'NF{p=1} p' | tac | awk 'NF{p=1} p' | tac > "$f.clean" && mv "$f.clean" "$f"
-done
+echo "== MMA active in native build:"
+grep -o "MMA = [01]" /tmp/server-mma.log | head -1 || echo "MMA flag not found in server banner; check /tmp/server-mma.log"
+
 if diff -q /tmp/out-mma.txt /tmp/out-ref.txt > /dev/null; then
-    T0="**PASS** — MMA and scalar outputs are token-identical"
+    T0="**PASS** -- MMA and scalar outputs are token-identical"
 else
-    T0="**FAIL** — outputs diverge (see diff below); do NOT deploy; please attach both outputs to an issue"
+    T0="**FAIL** -- outputs diverge (see diff below); do NOT deploy; please attach both outputs to an issue"
 fi
 echo "$T0"
 
