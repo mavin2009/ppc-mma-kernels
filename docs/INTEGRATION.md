@@ -21,7 +21,9 @@ panels),
 `0010-power-mma-pingpong-variant.patch` (compile-flag accumulator
 ping-pong for hardware arbitration),
 `0011-power-mma-q8-q4-replace.patch` (Q8_0 and Q4_0 rerouted from
-tinyBLAS_Q0_PPC to the pack-cached kernels,
+tinyBLAS_Q0_PPC to the pack-cached kernels),
+`0012-power-mma-gcc11-compat.patch` (dependent static_assert so the
+fork builds under RHEL GCC 11,
 with a one-shot driver that packs the calling thread's row tiles per
 call -- correct but not the final performance shape; the load-time
 repack.cpp integration is the follow-up). All are applied

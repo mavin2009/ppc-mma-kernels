@@ -1,0 +1,17 @@
+diff --git a/ggml/src/ggml-cpu/llamafile/sgemm.cpp b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+index 0add505..d363f3a 100644
+--- a/ggml/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -3627,7 +3627,11 @@ class tinyBLAS_PPC {
+         } else if constexpr(RM == 8 && RN == 8) {
+             KERNEL_8x8(ii, jj);
+         } else {
+-            static_assert(false, "RN/RM values not supported");
++            // dependent form: GCC < 13 evaluates a non-dependent
++            // static_assert(false) eagerly even in a discarded
++            // constexpr branch (pre-P2593); RM != RM defers it to
++            // instantiation, which never occurs for supported tiles.
++            static_assert(RM != RM, "RN/RM values not supported");
+         }
+     }
+ 
