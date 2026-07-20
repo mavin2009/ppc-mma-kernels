@@ -38,6 +38,8 @@
 typedef uint16_t ggml_half;
 
 typedef struct { ggml_half d, m; uint8_t qs[QK4_1/2]; } block_q4_1;
+#define QK4_0 32
+typedef struct { ggml_half d; uint8_t qs[QK4_0/2]; } block_q4_0;
 typedef struct { ggml_half d; uint8_t qh[4]; uint8_t qs[QK5_0/2]; } block_q5_0;
 typedef struct { ggml_half d, m; uint8_t qh[4]; uint8_t qs[QK5_1/2]; } block_q5_1;
 typedef struct { ggml_half d; int8_t qs[QK8_0]; } block_q8_0;
@@ -173,11 +175,15 @@ static void repack_generic(const BLK * A, int64_t lda, int64_t m, int64_t k, ale
 }
 
 static void codes_q4_1(const block_q4_1 * bp, vuc v[2]) { nibbles32(bp->qs, v); }
+static void codes_q4_0(const block_q4_0 * bp, vuc v[2]) { nibbles32(bp->qs, v); }
 static void codes_q5_0(const block_q5_0 * bp, vuc v[2]) { nibbles32(bp->qs, v); qh_merge(bp->qh, v); }
 static void codes_q5_1(const block_q5_1 * bp, vuc v[2]) { nibbles32(bp->qs, v); qh_merge(bp->qh, v); }
 
 extern "C" void leg_repack_q4_1(const block_q4_1 * A, int64_t lda, int64_t m, int64_t k, void * p) {
     repack_generic<block_q4_1, codes_q4_1, true>(A, lda, m, k, (aleg_t *)p);
+}
+extern "C" void leg_repack_q4_0(const block_q4_0 * A, int64_t lda, int64_t m, int64_t k, void * p) {
+    repack_generic<block_q4_0, codes_q4_0, false>(A, lda, m, k, (aleg_t *)p);
 }
 extern "C" void leg_repack_q5_0(const block_q5_0 * A, int64_t lda, int64_t m, int64_t k, void * p) {
     repack_generic<block_q5_0, codes_q5_0, false>(A, lda, m, k, (aleg_t *)p);
@@ -228,6 +234,10 @@ static void pack_b_generic(const YBLK * B, int64_t ldb, int64_t n, int64_t k, bl
 
 extern "C" void leg_pack_b_q8_0(const block_q8_0 * B, int64_t ldb, int64_t n, int64_t k, void * p) {
     pack_b_generic<block_q8_0, false, 16>(B, ldb, n, k, (bleg_t *)p);
+}
+// SFACT 8 variant for Q4_0's offset (t = q - 8)
+extern "C" void leg_pack_b_q8_0_o8(const block_q8_0 * B, int64_t ldb, int64_t n, int64_t k, void * p) {
+    pack_b_generic<block_q8_0, false, 8>(B, ldb, n, k, (bleg_t *)p);
 }
 extern "C" void leg_pack_b_q8_1(const block_q8_1 * B, int64_t ldb, int64_t n, int64_t k, void * p) {
     pack_b_generic<block_q8_1, true, 1>(B, ldb, n, k, (bleg_t *)p);
@@ -364,11 +374,12 @@ int main() {
         { 64, 16, 2048 }, { 40, 24, 4096 }, { 17, 9, 2304 },
         { 32, 1, 1024 }, { 9, 3, 2176 },
     };
-    for (int type = 0; type < 3; type++) {          // 0=q4_1 1=q5_0 2=q5_1
+    for (int type = 0; type < 4; type++) {          // 0=q4_1 1=q5_0 2=q5_1 3=q4_0
         for (auto & tc : cases) {
             const int64_t m = tc.m, n = tc.n, k = tc.k;
             const int64_t lda = k/32, ldb = k/32, ldc = m;
             block_q4_1 * A1 = nullptr; block_q5_0 * A50 = nullptr; block_q5_1 * A51 = nullptr;
+            block_q4_0 * A40 = nullptr;
             if (type == 0) {
                 A1 = (block_q4_1*)aligned_alloc(64, m*lda*sizeof(block_q4_1));
                 for (int64_t i = 0; i < m*lda; i++) {
@@ -383,6 +394,12 @@ int main() {
                     for (int b = 0; b < 4; b++)  A50[i].qh[b] = (uint8_t)(xr() & 0xff);
                     for (int b = 0; b < 16; b++) A50[i].qs[b] = (uint8_t)(xr() & 0xff);
                 }
+            } else if (type == 3) {
+                A40 = (block_q4_0*)aligned_alloc(64, ((m*lda*sizeof(block_q4_0))+63)&~63ul);
+                for (int64_t i = 0; i < m*lda; i++) {
+                    A40[i].d = f32_to_f16_approx(0.0005f + (xr()%1000)/400000.0f);
+                    for (int b = 0; b < 16; b++) A40[i].qs[b] = (uint8_t)(xr() & 0xff);
+                }
             } else {
                 A51 = (block_q5_1*)aligned_alloc(64, m*lda*sizeof(block_q5_1));
                 for (int64_t i = 0; i < m*lda; i++) {
@@ -392,7 +409,7 @@ int main() {
                     for (int b = 0; b < 16; b++) A51[i].qs[b] = (uint8_t)(xr() & 0xff);
                 }
             }
-            const bool use_q81 = (type != 1);
+            const bool use_q81 = (type == 0 || type == 2);
             block_q8_0 * B0 = nullptr; block_q8_1 * B1 = nullptr;
             if (use_q81) {
                 B1 = (block_q8_1*)aligned_alloc(64, n*ldb*sizeof(block_q8_1));
@@ -422,6 +439,9 @@ int main() {
             if (type == 2) { leg_repack_q5_1(A51, lda, m, k, PA); leg_pack_b_q8_1(B1, ldb, n, k, PB);
                              leg_gemm_affine(m, n, k, PA, PB, C, ldc, 0, 2);
                              leg_gemm_affine(m, n, k, PA, PB, C, ldc, 1, 2); }
+            if (type == 3) { leg_repack_q4_0(A40, lda, m, k, PA); leg_pack_b_q8_0_o8(B0, ldb, n, k, PB);
+                             leg_gemm_offset(m, n, k, PA, PB, C, ldc, 0, 2);
+                             leg_gemm_offset(m, n, k, PA, PB, C, ldc, 1, 2); }
 
             double emax = 0, scale = 0;
             for (int64_t i = 0; i < m; i++)
@@ -438,6 +458,10 @@ int main() {
                             } else if (type == 1) {
                                 const block_q5_0 * bp = &A50[i*lda + b];
                                 w = fp16_to_fp32(bp->d)*(q5code(bp->qs, bp->qh, l) - 16);
+                            } else if (type == 3) {
+                                const block_q4_0 * bp = &A40[i*lda + b];
+                                int q = l < 16 ? (bp->qs[l] & 0xF) : (bp->qs[l-16] >> 4);
+                                w = fp16_to_fp32(bp->d)*(q - 8);
                             } else {
                                 const block_q5_1 * bp = &A51[i*lda + b];
                                 w = fp16_to_fp32(bp->d)*q5code(bp->qs, bp->qh, l) + fp16_to_fp32(bp->m);
@@ -448,7 +472,7 @@ int main() {
                         const double dy = use_q81 ? fp16_to_fp32(B1[j*ldb + b].d)
                                                   : fp16_to_fp32(B0[j*ldb + b].d);
                         // affine ref uses the STORED s for the min term, as the kernel does
-                        if (type != 1) {
+                        if (type == 0 || type == 2) {
                             const block_q8_1 * yb = &B1[j*ldb + b];
                             double P = 0;
                             for (int l = 0; l < 32; l++) {
@@ -477,11 +501,11 @@ int main() {
                 }
             scale = scale/(m*n) + 1e-30; emax /= scale;
             bool ok = emax < 1e-5;
-            const char * nm = type == 0 ? "q4_1" : type == 1 ? "q5_0" : "q5_1";
+            const char * nm = type == 0 ? "q4_1" : type == 1 ? "q5_0" : type == 3 ? "q4_0" : "q5_1";
             printf("%s m=%3lld n=%3lld k=%5lld  err=%.3g  %s\n",
                    nm, (long long)m,(long long)n,(long long)k, emax, ok?"OK":"FAIL");
             if (!ok) fails++;
-            free(A1); free(A50); free(A51); free(B0); free(B1);
+            free(A1); free(A50); free(A51); free(A40); free(B0); free(B1);
             free(C); free(PA); free(PB);
         }
     }

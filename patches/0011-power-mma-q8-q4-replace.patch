@@ -1,0 +1,140 @@
+diff --git a/ggml/src/ggml-cpu/llamafile/iq4_ppc_mma.cpp b/ggml/src/ggml-cpu/llamafile/iq4_ppc_mma.cpp
+index 5388620..b76eb2b 100644
+--- a/ggml/src/ggml-cpu/llamafile/iq4_ppc_mma.cpp
++++ b/ggml/src/ggml-cpu/llamafile/iq4_ppc_mma.cpp
+@@ -150,6 +150,30 @@ extern "C" void iq4nl_repack_a(const block_iq4_nl * A, int64_t lda,
+     }
+ }
+ 
++// ---- weight repack: Q8_0 (signed int8 weights, identity decode) ----
++extern "C" void q8_0_repack_a(const block_q8_0 * A, int64_t lda,
++                              int64_t m, int64_t k, void * packed) {
++    aiq4_t * P = (aiq4_t *)packed;
++    const int64_t kb = k/32, ns = sl32(k);
++    for (int64_t it = 0; it < rt8(m); it++)
++    for (int64_t s = 0; s < ns; s++) {
++        aiq4_t * T = &P[it*ns + s];
++        const int64_t b0 = s*KC_CH;
++        const int64_t nb = (kb - b0) < KC_CH ? (kb - b0) : KC_CH;
++        for (int64_t b = 0; b < nb; b++) {
++            vsc w[MR][2]; float sc[MR];
++            for (int r = 0; r < MR; r++) {
++                int64_t rr = it*MR + r; if (rr >= m) rr = m - 1;
++                const block_q8_0 * bp = &A[rr*lda + b0 + b];
++                sc[r] = GGML_FP16_TO_FP32(bp->d);
++                w[r][0] = (vsc)load16u(bp->qs);
++                w[r][1] = (vsc)load16u(bp->qs + 16);
++            }
++            iq4_place_chunk(T, b, w, sc);
++        }
++    }
++}
++
+ // ---- weight repack: MXFP4 (same shape as IQ4_NL, different table+scale) ----
+ extern "C" void mxfp4_repack_a(const block_mxfp4 * A, int64_t lda,
+                                int64_t m, int64_t k, void * packed) {
+@@ -395,6 +419,7 @@ extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
+ IQ4_ONESHOT(gemm_iq4_nl_q8_0_ppc, block_iq4_nl, iq4nl_repack_a, block_q8_0, iq4_pack_b_q8_0, 1)
+ IQ4_ONESHOT(gemm_iq4_xs_q8_K_ppc, block_iq4_xs, iq4xs_repack_a, block_q8_K, iq4_pack_b_q8_K, 2)
+ IQ4_ONESHOT(gemm_mxfp4_q8_0_ppc, block_mxfp4, mxfp4_repack_a, block_q8_0, iq4_pack_b_q8_0, 3)
++IQ4_ONESHOT(gemm_q8_0_q8_0_ppc, block_q8_0, q8_0_repack_a, block_q8_0, iq4_pack_b_q8_0, 4)
+ 
+ #endif // __MMA__
+ 
+diff --git a/ggml/src/ggml-cpu/llamafile/kquants_ppc_mma.h b/ggml/src/ggml-cpu/llamafile/kquants_ppc_mma.h
+index 7d08d00..0024f5d 100644
+--- a/ggml/src/ggml-cpu/llamafile/kquants_ppc_mma.h
++++ b/ggml/src/ggml-cpu/llamafile/kquants_ppc_mma.h
+@@ -69,6 +69,12 @@ void gemm_iq1_m_q8_K_ppc(int64_t m, int64_t n, int64_t k,
+ void gemm_nvfp4_q8_0_ppc(int64_t m, int64_t n, int64_t k,
+         const void * A, int64_t lda, const void * B, int64_t ldb,
+         float * C, int64_t ldc, int ith, int nth);
++void gemm_q8_0_q8_0_ppc(int64_t m, int64_t n, int64_t k,
++        const void * A, int64_t lda, const void * B, int64_t ldb,
++        float * C, int64_t ldc, int ith, int nth);
++void gemm_q4_0_q8_0_ppc(int64_t m, int64_t n, int64_t k,
++        const void * A, int64_t lda, const void * B, int64_t ldb,
++        float * C, int64_t ldc, int ith, int nth);
+ // tensor-keyed cache for repacked weights (ppc_pack_cache.cpp)
+ #include <stddef.h>
+ void * ppc_apack_cache_acquire(const void * key, int64_t m, int64_t k,
+diff --git a/ggml/src/ggml-cpu/llamafile/legacy_ppc_mma.cpp b/ggml/src/ggml-cpu/llamafile/legacy_ppc_mma.cpp
+index 6908713..012e902 100644
+--- a/ggml/src/ggml-cpu/llamafile/legacy_ppc_mma.cpp
++++ b/ggml/src/ggml-cpu/llamafile/legacy_ppc_mma.cpp
+@@ -132,12 +132,16 @@ static void repack_generic(const BLK * A, int64_t lda, int64_t m, int64_t k, ale
+ }
+ 
+ static void codes_q4_1(const block_q4_1 * bp, vuc v[2]) { nibbles32(bp->qs, v); }
++static void codes_q4_0(const block_q4_0 * bp, vuc v[2]) { nibbles32(bp->qs, v); }
+ static void codes_q5_0(const block_q5_0 * bp, vuc v[2]) { nibbles32(bp->qs, v); qh_merge(bp->qh, v); }
+ static void codes_q5_1(const block_q5_1 * bp, vuc v[2]) { nibbles32(bp->qs, v); qh_merge(bp->qh, v); }
+ 
+ extern "C" void leg_repack_q4_1(const block_q4_1 * A, int64_t lda, int64_t m, int64_t k, void * p) {
+     repack_generic<block_q4_1, codes_q4_1, true>(A, lda, m, k, (aleg_t *)p);
+ }
++extern "C" void leg_repack_q4_0(const block_q4_0 * A, int64_t lda, int64_t m, int64_t k, void * p) {
++    repack_generic<block_q4_0, codes_q4_0, false>(A, lda, m, k, (aleg_t *)p);
++}
+ extern "C" void leg_repack_q5_0(const block_q5_0 * A, int64_t lda, int64_t m, int64_t k, void * p) {
+     repack_generic<block_q5_0, codes_q5_0, false>(A, lda, m, k, (aleg_t *)p);
+ }
+@@ -188,6 +192,10 @@ static void pack_b_generic(const YBLK * B, int64_t ldb, int64_t n, int64_t k, bl
+ extern "C" void leg_pack_b_q8_0(const block_q8_0 * B, int64_t ldb, int64_t n, int64_t k, void * p) {
+     pack_b_generic<block_q8_0, false, 16>(B, ldb, n, k, (bleg_t *)p);
+ }
++// SFACT 8 variant for Q4_0's offset (t = q - 8)
++extern "C" void leg_pack_b_q8_0_o8(const block_q8_0 * B, int64_t ldb, int64_t n, int64_t k, void * p) {
++    pack_b_generic<block_q8_0, false, 8>(B, ldb, n, k, (bleg_t *)p);
++}
+ extern "C" void leg_pack_b_q8_1(const block_q8_1 * B, int64_t ldb, int64_t n, int64_t k, void * p) {
+     pack_b_generic<block_q8_1, true, 1>(B, ldb, n, k, (bleg_t *)p);
+ }
+@@ -339,6 +347,7 @@ extern "C" void NAME(int64_t m, int64_t n, int64_t k,                          \
+ LEG_ONESHOT(gemm_q4_1_q8_1_ppc, block_q4_1, leg_repack_q4_1, block_q8_1, leg_pack_b_q8_1, leg_gemm_affine, 25)
+ LEG_ONESHOT(gemm_q5_0_q8_0_ppc, block_q5_0, leg_repack_q5_0, block_q8_0, leg_pack_b_q8_0, leg_gemm_offset, 26)
+ LEG_ONESHOT(gemm_q5_1_q8_1_ppc, block_q5_1, leg_repack_q5_1, block_q8_1, leg_pack_b_q8_1, leg_gemm_affine, 27)
++LEG_ONESHOT(gemm_q4_0_q8_0_ppc, block_q4_0, leg_repack_q4_0, block_q8_0, leg_pack_b_q8_0_o8, leg_gemm_offset, 28)
+ 
+ #endif // __MMA__
+ 
+diff --git a/ggml/src/ggml-cpu/llamafile/sgemm.cpp b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+index 0b0ff6d..0add505 100644
+--- a/ggml/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -3952,12 +3952,11 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+            return false;
+         if (m < 8 && m != 4)
+            return false;
+-        tinyBLAS_Q0_PPC<block_q8_0> tb{
+-            k, (const block_q8_0 *)A, lda,
+-            (const block_q8_0 *)B, ldb,
+-            (float *)C, ldc,
+-            params->ith, params->nth};
+-        tb.matmul(m, n);
++        // routed through the pack-cached MMA kernels (patch 0011); replaces
++        // tinyBLAS_Q0_PPC, whose per-call weight repack, scalar comparray
++        // fixup and absent GEMV path made it the slow producer here.
++        gemm_q8_0_q8_0_ppc(m, n, k * QK8_0, A, lda, B, ldb,
++            (float *)C, ldc, params->ith, params->nth);
+         return true;
+ #else
+         return false;
+@@ -4243,12 +4242,11 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+            return false;
+         if (m < 8 && m != 4)
+            return false;
+-        tinyBLAS_Q0_PPC<block_q4_0> tb{
+-            k, (const block_q4_0 *)A, lda,
+-            (const block_q8_0 *)B, ldb,
+-            (float *)C, ldc,
+-            params->ith, params->nth};
+-        tb.matmul(m, n);
++        // routed through the pack-cached MMA kernels (patch 0011); replaces
++        // tinyBLAS_Q0_PPC, whose per-call weight repack, scalar comparray
++        // fixup and absent GEMV path made it the slow producer here.
++        gemm_q4_0_q8_0_ppc(m, n, k * QK4_0, A, lda, B, ldb,
++            (float *)C, ldc, params->ith, params->nth);
+         return true;
+ #else
+         return false;
