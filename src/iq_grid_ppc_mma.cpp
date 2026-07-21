@@ -358,8 +358,12 @@ static void grid_place_chunk(agrid_t * T, int64_t ch,
             W[r] = (float)hsum(s);
         }
         T->sA  [ch][g] = (vfl){ scale[4*g], scale[4*g+1], scale[4*g+2], scale[4*g+3] };
-        T->C128[ch][g] = (vfl){ 128.0f*W[0]*scale[4*g],   128.0f*W[1]*scale[4*g+1],
-                                128.0f*W[2]*scale[4*g+2], 128.0f*W[3]*scale[4*g+3] };
+        // exact integer correction 128*W (|W|<=32*127 so 128*W < 2^24:
+        // exactly representable; the fixup subtracts it from the exact
+        // integer accumulator BEFORE scaling, so the subtraction is
+        // exact and the result matches ggml's scalar rounding order)
+        T->C128[ch][g] = (vfl){ 128.0f*W[0], 128.0f*W[1],
+                                128.0f*W[2], 128.0f*W[3] };
     }
 }
 
@@ -481,9 +485,13 @@ __attribute__((unused)) static void kernel_grid_8x8(const agrid_t * PA, const bg
                 __builtin_mma_disassemble_acc(rowsP, &acc[g][cgi]);
                 const vfl dB = PB->dB[ch][cgi];
                 for (int r = 0; r < 4; r++) {
-                    vfl t = vec_msub(vec_ctf(rowsP[r],0),
-                                     vec_splats(sA[r]), vec_splats(C128[r]));
-                    fin[4*g + r][cgi] = vec_madd(t, dB, fin[4*g + r][cgi]);
+                    // exact int subtract, then one (dA*dB) product, then
+                    // fma -- the same rounding sequence as ggml's scalar
+                    // vec_dot, restoring temp-0 bit identity (field FAIL,
+                    // Q8_0 27B, 2026-07-21)
+                    vfl t = vec_sub(vec_ctf(rowsP[r],0), vec_splats(C128[r]));
+                    vfl sc = vec_mul(vec_splats(sA[r]), dB);
+                    fin[4*g + r][cgi] = vec_madd(t, sc, fin[4*g + r][cgi]);
                 }
             }
         }
@@ -531,9 +539,9 @@ static inline void grid_pp_fixup(const agrid_t * PA, const bgrid_t * PB,
             __builtin_mma_disassemble_acc(rowsP, &acc[g][cgi]);
             const vfl dB = PB->dB[ch][cgi];
             for (int r = 0; r < 4; r++) {
-                vfl t = vec_msub(vec_ctf(rowsP[r],0),
-                                 vec_splats(sA[r]), vec_splats(C128[r]));
-                fin[4*g + r][cgi] = vec_madd(t, dB, fin[4*g + r][cgi]);
+                vfl t = vec_sub(vec_ctf(rowsP[r],0), vec_splats(C128[r]));
+                vfl sc = vec_mul(vec_splats(sA[r]), dB);
+                fin[4*g + r][cgi] = vec_madd(t, sc, fin[4*g + r][cgi]);
             }
         }
     }
@@ -624,8 +632,12 @@ static void grid16_place_chunk(agrid16_t * T, int64_t ch,
             W[r] = (float)hsum(sm);
         }
         T->sA  [ch][g] = (vfl){ scale[4*g], scale[4*g+1], scale[4*g+2], scale[4*g+3] };
-        T->C128[ch][g] = (vfl){ 128.0f*W[0]*scale[4*g],   128.0f*W[1]*scale[4*g+1],
-                                128.0f*W[2]*scale[4*g+2], 128.0f*W[3]*scale[4*g+3] };
+        // exact integer correction 128*W (|W|<=32*127 so 128*W < 2^24:
+        // exactly representable; the fixup subtracts it from the exact
+        // integer accumulator BEFORE scaling, so the subtraction is
+        // exact and the result matches ggml's scalar rounding order)
+        T->C128[ch][g] = (vfl){ 128.0f*W[0], 128.0f*W[1],
+                                128.0f*W[2], 128.0f*W[3] };
     }
 }
 
@@ -789,9 +801,13 @@ static void kernel_grid16_8x8(const agrid16_t * PA, const bgrid16_t * PB,
                 __builtin_mma_disassemble_acc(rowsP, &acc[g][cgi]);
                 const vfl dB = PB->dB[ch][cgi];
                 for (int r = 0; r < 4; r++) {
-                    vfl t = vec_msub(vec_ctf(rowsP[r],0),
-                                     vec_splats(sA[r]), vec_splats(C128[r]));
-                    fin[4*g + r][cgi] = vec_madd(t, dB, fin[4*g + r][cgi]);
+                    // exact int subtract, then one (dA*dB) product, then
+                    // fma -- the same rounding sequence as ggml's scalar
+                    // vec_dot, restoring temp-0 bit identity (field FAIL,
+                    // Q8_0 27B, 2026-07-21)
+                    vfl t = vec_sub(vec_ctf(rowsP[r],0), vec_splats(C128[r]));
+                    vfl sc = vec_mul(vec_splats(sA[r]), dB);
+                    fin[4*g + r][cgi] = vec_madd(t, sc, fin[4*g + r][cgi]);
                 }
             }
         }
