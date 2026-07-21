@@ -61,6 +61,16 @@ run_gen build-ref /tmp/out-ref.txt /tmp/server-ref.log
 echo "[$(date +%H:%M:%S)] == MMA active in native build:"
 grep -o "MMA = [01]" /tmp/server-mma.log | head -1 || echo "MMA flag not found in server banner; check /tmp/server-mma.log"
 
+# preflight: fail LOUDLY, never silently
+for f in /tmp/out-mma.txt /tmp/out-ref.txt /tmp/out-mma.txt.json /tmp/out-ref.txt.json; do
+    if [ ! -s "$f" ]; then
+        echo "ERROR: $f missing or empty -- generation phase failed."
+        echo "  server logs: /tmp/server-mma.log /tmp/server-ref.log"
+        echo "  raw responses: /tmp/out-*.txt.json"
+        T0="**INDETERMINATE** -- generation produced no output; see messages above"
+    fi
+done
+set +e   # nothing in the gate below may abort the script silently
 # Two-tier gate. Tier 1: token identity (strong PASS). Tier 2: the
 # -mcpu=power9 reference runs ggml's VSX vec_dot, whose vector partial
 # sums + horizontal reduction form a DIFFERENT rounding tree than any
@@ -69,7 +79,9 @@ grep -o "MMA = [01]" /tmp/server-mma.log | head -1 || echo "MMA flag not found i
 # genuine near-tie: the road-not-taken token must sit within TOL
 # logprob of the chosen one in BOTH runs. Anything larger is a real
 # numerical defect and fails.
-if diff -q /tmp/out-mma.txt /tmp/out-ref.txt > /dev/null; then
+if [ -n "${T0:-}" ]; then
+    : # preflight already decided
+elif diff -q /tmp/out-mma.txt /tmp/out-ref.txt > /dev/null; then
     T0="**PASS** -- MMA and scalar outputs are token-identical"
 else
     T0=$(python3 - << 'PYGATE'
@@ -111,6 +123,7 @@ PYGATE
 )
 fi
 echo "$T0"
+set -e
 
 echo "[$(date +%H:%M:%S)] == llama-bench (this takes a few minutes)"
 # llama-bench defaults to a physical-core heuristic (often 4 on
