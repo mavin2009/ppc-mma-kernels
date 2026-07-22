@@ -42,8 +42,20 @@ run_gen() {   # $1 = build dir, $2 = output file, $3 = server log
         sleep 2
     done
     if [ $up -ne 1 ]; then echo "server failed to start ($1); see $3"; kill $SPID 2>/dev/null; exit 1; fi
-    curl -s --connect-timeout 5 --max-time 1800 "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json'         -d "{\"prompt\": \"$PROMPT\", \"n_predict\": 32, \"temperature\": 0, \"seed\": 42, \"cache_prompt\": false}"         | python3 -c 'import json,sys; print(json.load(sys.stdin).get("content",""))' > "$2"
-    kill $SPID 2>/dev/null; wait $SPID 2>/dev/null
+    curl -s --connect-timeout 5 --max-time 1800 "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' \
+        -d "{\"prompt\": \"$PROMPT\", \"n_predict\": 32, \"temperature\": 0, \"seed\": 42, \"cache_prompt\": false, \"n_probs\": 5}" \
+        > "$2.json" || true
+    python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("content",""))
+except Exception as e:
+    sys.stderr.write("extract failed: %s\n" % e)' < "$2.json" > "$2" || true
+    if [ ! -s "$2" ]; then
+        echo "WARNING: empty generation from $1 -- first 300 bytes of server response:"
+        head -c 300 "$2.json" 2>/dev/null; echo
+    fi
+    kill $SPID 2>/dev/null || true
+    wait $SPID 2>/dev/null || true
 }
 
 echo "[$(date +%H:%M:%S)] == building MMA (native) variant"
