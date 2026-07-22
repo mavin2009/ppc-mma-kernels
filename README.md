@@ -87,12 +87,16 @@ temperature-0 gates across Q2_0, Q4_K/Q6_K, Q5_K and the IQ2/IQ3
 grids — token-identical or certified within the machine's measured
 cross-codegen envelope. docs/VALIDATION-POWER10.md has the full
 story, including the forged-PASS incident that voided the first
-attempt and the two findings that matter for deployment: prompt
-processing is 4–46× faster with MMA across every format tested, and
-token generation is faster only for the qbit formats — the
-packed-cache formats currently *lose* generation to ggml's VSX
-vec_dot until a qbit-style GEMV path lands for them. Emulation
-priced neither effect; that is why 0.9.0 was labeled
+attempt and the performance finding that mattered: prompt processing
+is 4–46× faster with MMA across every format tested, while token
+generation initially *lost* to ggml's VSX vec_dot for the
+packed-cache formats — a cache-slot exhaustion bug stacked on the
+int8-expansion bandwidth tax, both found by their thread-scaling
+signature and fixed the same day (patch 0015: bigger cache, and
+below one column tile the dispatch hands generation back to
+vec_dot). Post-fix, generation is at reference parity or better for
+every format tested and qbit formats keep their 4.4× win. Emulation
+priced none of this; that is why 0.9.0 was labeled
 emulation-verified and why the validation script exists. If you have
 a Power10 or Power11 machine, scripts/validate-on-power.sh runs the
 whole protocol — now a three-tier gate with a codegen-envelope

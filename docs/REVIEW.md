@@ -18,11 +18,11 @@ that has never found a defect in itself hasn't looked.
 | Allocation-failure behavior (in-tree drivers) | `GGML_ABORT` instead of silent skip | Fixed (patch 0006) |
 | Out-of-bounds loads at block-array tails | Manual audit of every load against struct extents; one real OOB found and fixed in the v1 kernels | Audited |
 | Integer overflow in GER accumulation | Bounds analysis: max chunk dot ≪ 2³¹ for every format | Verified by analysis |
-| Patch-series integrity (0001–0014) | Sequential `git apply` gate on a pristine checkout of the pinned base; result diffed against the build-verified tree | Verified, byte-identical |
+| Patch-series integrity (0001–0015) | Sequential `git apply` gate on a pristine checkout of the pinned base; result diffed against the build-verified tree | Verified, byte-identical (0015 verified against the silicon-validated tree) |
 | Fork integration compiles + links | ppc64le cross-build, GCC 14, all 10 kernel TUs in ggml-cpu; `llama-cli` executes under qemu | Verified |
 | End-to-end inference numerics through patched dispatch | Temp-0 gates on POWER10 hardware, four models spanning Q2_0, Q4_K/Q6_K, Q5_K, IQ2_S/IQ3_S/IQ3_XXS | Verified (token identity, or certified within the measured cross-codegen envelope; VALIDATION-POWER10.md) |
 | Grid/ternary/codebook decoders vs ggml's dequantization | Test refs share the decoders (consistency only); decoders are line-by-line ports | **NOT independently verified** — E2E gates now exercise IQ2_S/IQ3_S/IQ3_XXS through ggml's own activation path, but an exhaustive decoder-vs-`dequantize_row` cross-check is still the right tool |
-| Performance on silicon | `llama-bench`, MMA vs `-mcpu=power9` reference, same LPAR | Measured — pp 4–46× faster; tg 4.4× faster (qbit) but **2.8–7.8× slower for packed-cache formats** (open work item; VALIDATION-POWER10.md) |
+| Performance on silicon | `llama-bench`, MMA vs `-mcpu=power9` reference, same LPAR | Measured — pp 4–46× faster; tg initially 2.8–7.8× slower for packed-cache formats, root-caused (slot exhaustion + int8-expansion tax) and fixed in patch 0015: tg now at reference parity or better everywhere, qbit keeps 4.4× (VALIDATION-POWER10.md) |
 | UBSan on silicon | Native rebuild of qbit/q4_K/iq_grid/iq_grid_pp/legacy suites with `-fsanitize=undefined` | Clean |
 
 ## Defects this project found in itself
@@ -66,6 +66,17 @@ Disclosed here deliberately; each one changed a process, not just a line.
   "a real numerical defect." The gate now measures the envelope with
   a `-mcpu=power8` control build before confirming any FAIL. A gate
   that can only false-PASS or only false-FAIL is half a gate.
+- **Cache slot exhaustion (second cache defect).** The fix for the
+  round-robin-thrash flaw above (admission-without-eviction) silently
+  introduced its successor: 128 fixed slots against the ~197 quantized
+  tensors of an ordinary 28-layer model, so a third of the weights
+  re-decoded and re-packed on *every call* — invisible under qemu,
+  where a repack and a GER cost the same. Found on silicon by the
+  thread-scaling signature (linear tg scaling far below bandwidth);
+  proven by a slot-count A/B (tg doubled, pp +12–38%). Fixed in patch
+  0015 alongside the small-n dispatch guard. Twice now a cache policy
+  fix has shipped with its own sequel; the lesson recorded is that
+  capacity policies need a test at N > capacity, not a design review.
 - Two git recovery commits from process mistakes remain in history
   with honest messages; the test matrix, not the history, is the
   arbiter of code state.

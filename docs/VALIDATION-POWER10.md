@@ -137,20 +137,57 @@ generation splits into two regimes:
 
 - **qbit formats win tg** (4.4×): v4 has a dedicated no-packing GEMV
   path that reads weights at their native 1–2 bits per element.
-- **Packed-cache formats lose tg**, 2.8× (Q4_K) to 7.8× (IQ2_M),
-  against ggml's own VSX vec_dot. The signature is diagnostic: MMA
-  tg is ~1.1/2.2/4.2 t/s at 2/4/8 threads for *both* IQ models
-  regardless of their size — linear thread scaling, far below
-  bandwidth (4.18 t/s × 568 MiB ≈ 2.4 GB/s) — i.e. compute-bound on
-  per-token pack/decode work in the n=1 path, not memory-bound
-  inference. The qbit GEMV design is the proven in-repo fix pattern;
-  extending it to the K-quant and grid kernels is now the top
-  performance work item, and no deployment serving generation-heavy
-  traffic should ship the MMA build for these formats until it lands.
+- **Packed-cache formats lost tg**, 2.8× (Q4_K) to 7.8× (IQ2_M),
+  against ggml's own VSX vec_dot — as first measured. The signature
+  was diagnostic: MMA tg was ~1.1/2.2/4.2 t/s at 2/4/8 threads for
+  *both* IQ models regardless of size — linear thread scaling, far
+  below bandwidth (4.18 t/s × 568 MiB ≈ 2.4 GB/s) — compute-bound on
+  per-token work in the n=1 path, not memory-bound inference. That
+  signature led to the root cause the same day; see below.
 
 This is exactly the class of result emulation could not price, and it
 cuts both ways: the 46× pp win and the 7.8× tg loss were equally
 invisible to instruction counting.
+
+### Root cause and fix (patch 0015)
+
+The tg loss was two stacked defects, separated by a single-variable
+experiment each:
+
+1. **Cache slot exhaustion.** The pack cache — admission-only, no
+   eviction, the policy that fixed the previous cache defect — has
+   128 fixed slots. A 28-layer model carries ~197 quantized matmul
+   tensors. The 69 that lose the race at load re-decode and re-pack
+   on *every call*, generation and prompt alike. Raising slots to
+   1024 alone doubled IQ2_M tg (4.18 → 8.45 t/s) and, unexpectedly
+   but obviously in hindsight, raised pp too (IQ3_XS +38%: those 69
+   tensors were paying grid decode per pp call as well).
+2. **The int8-expansion tax.** Even at a 100% hit rate the n=1 path
+   reads the int8-expanded pack — ~3× the native weight bytes for
+   2.7-bpw IQ2_M, 1.8× for Q4_K — so the packed GEMV loses the
+   bandwidth race to vec_dot's native-width reads by construction.
+   8.45 t/s ≈ the expanded pack at memory speed; no cache tuning can
+   cross that line. The fix follows the tree's own precedent for
+   Q8_0/Q4_0 (patch 0011): below one column tile (`n < 8`) the
+   dispatch declines and ggml's vec_dot — compiled `-mcpu=power10` in
+   the MMA build — keeps generation.
+
+After 0015, same machine, same models, 8 threads:
+
+| model | tg32 before | tg32 after | tg32 reference | pp128 before | pp128 after |
+|---|--:|--:|--:|--:|--:|
+| Q4_K 27B | 1.41 | **3.80** | 3.90 | 22.3 | 21.9 |
+| IQ2_M 1.5B | 4.18 | **35.70** | 32.6 | 172.8 | 199.7 |
+| IQ3_XS 1.5B | 4.28 | **27.57** | 26.5 | 228.4 | 316.4 |
+
+Generation is at reference parity or better everywhere (the 1.5B
+models beat it outright — the same vec_dot, but power10 codegen), and
+prompt processing kept every win and gained up to 38% from the slot
+fix. The temp-0 gate re-run on the fixed build passes at tier 2
+(near-tie, gaps 0.082 ≤ 0.10). A true low-bit GEMV in the qbit style
+— reading 2–4-bit weights directly on the MMA path — remains the way
+to *win* tg rather than tie it, and remains open by choice: the
+fallback is correct, simple, and already shipped.
 
 ## IQGRID_PINGPONG: hardware picked the winner, barely
 
@@ -162,9 +199,10 @@ t/s at 8t, outside noise), costs 1–5% in prompt processing (61.1 vs
 64.5 t/s at 2t), and moves IQ2_M by less than ±1% anywhere. The 3%
 static-instruction cost predicted in DESIGN.md shows up in pp almost
 exactly as counted; the engine-idle removal is real but small at this
-scale. **Standard stays the default.** The A/B should be repeated
-once the GEMV work lands, since tg is where ping-pong helps and tg is
-currently dominated by the pack overhead above.
+scale. **Standard stays the default.** (Measured before patch 0015;
+with the small-n dispatch guard, generation no longer runs the grid
+MMA kernels at all, so only the pp side of this A/B — where standard
+wins — remains live. Revisit if a true low-bit GEMV lands.)
 
 ## Field notes
 
