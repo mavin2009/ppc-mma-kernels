@@ -15,8 +15,8 @@ Two consequences:
 - **Invalid**: absolute throughput, anything memory-bound, thread
   scaling, and cross-format comparisons (each suite's workload differs).
 
-Hardware numbers (`llama-bench` on Power10/11) supersede everything
-here on arrival; see DEPLOY.md step 5.
+Hardware numbers now exist and supersede everything here:
+see VALIDATION-POWER10.md.
 
 ## Same-workload comparisons (the meaningful part)
 
