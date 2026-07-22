@@ -81,19 +81,22 @@ defect log in docs/REVIEW.md is honest about that and about the other
 things I got wrong, because a repo that has never found a defect in
 itself has not looked.
 
-What is not verified is anything requiring silicon. Emulation prices
-every instruction identically, models no cache and no engine, and so
-every performance statement in this repository is either exact static
-accounting or a clearly labeled instruction proxy. There are no
-absolute performance claims here, which is how you can tell the
-relative ones are honest. Version 0.9.0 marks the emulation-verified
-state; 1.0.0 is reserved for the first hardware validation. If you
-have a Power10 or Power11 machine, scripts/validate-on-power.sh will
-build MMA and no-MMA variants, run a temperature-0 token-identity
-comparison (one test that simultaneously validates the GER semantics,
-all the decoders and the dispatch), benchmark both, and hand you a
-report to paste into an issue. Twenty minutes of your LPAR closes the
-one gap I cannot.
+The first hardware validation ran on 2026-07-22 on a POWER10 LPAR:
+all fourteen kernel suites and UBSan clean natively, and end-to-end
+temperature-0 gates across Q2_0, Q4_K/Q6_K, Q5_K and the IQ2/IQ3
+grids — token-identical or certified within the machine's measured
+cross-codegen envelope. docs/VALIDATION-POWER10.md has the full
+story, including the forged-PASS incident that voided the first
+attempt and the two findings that matter for deployment: prompt
+processing is 4–46× faster with MMA across every format tested, and
+token generation is faster only for the qbit formats — the
+packed-cache formats currently *lose* generation to ggml's VSX
+vec_dot until a qbit-style GEMV path lands for them. Emulation
+priced neither effect; that is why 0.9.0 was labeled
+emulation-verified and why the validation script exists. If you have
+a Power10 or Power11 machine, scripts/validate-on-power.sh runs the
+whole protocol — now a three-tier gate with a codegen-envelope
+control — and hands you a report to paste into an issue.
 
 ## Layout and use
 

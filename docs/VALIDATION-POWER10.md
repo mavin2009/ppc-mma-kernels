@@ -1,147 +1,200 @@
-# First hardware validation: POWER10
+# Hardware validation: POWER10
 
-This is the run that BENCHMARKS-QEMU.md promised would supersede it —
-the first execution of this repository on real Power silicon, closing
-the gap the README labels "what is not verified." Everything below was
-produced by the unmodified tree at commit `d8882ba` on 2026-07-22; the
-validation itself is the stock `scripts/validate-on-power.sh`, no
-hand-editing, no retries.
+First contact between this repository and real Power silicon: an IBM
+9105-42A (Power S1022) LPAR, POWER10 architected mode, 8 hardware
+threads, 123 GiB RAM, RHEL 9.7, GCC 11.5.0, on 2026-07-22. The
+kernels and patches ran unmodified at commit `d8882ba`; the
+*validation harness* did not survive the day unmodified, and the
+first half of this page explains why before any result is claimed.
+An earlier revision of this page reported a hardware PASS whose
+evidence was void — see the incident below. This revision replaces
+it; nothing here rests on the invalidated runs.
 
-## The machine
+Being an LPAR, absolute throughput is specific to this partition's
+entitlement. MMA-vs-reference ratios were measured on the same
+partition minutes apart and are the numbers that travel.
 
-IBM 9105-42A (Power S1022) LPAR, POWER10 "architected" mode, 8
-hardware threads visible, 123 GiB RAM. RHEL 9.7, kernel
-5.14.0-611.42.1.el9_7.ppc64le, GCC 11.5.0. Being an LPAR, the
-absolute throughput numbers are specific to this partition's
-entitlement; the MMA-vs-reference ratios were measured on the same
-partition minutes apart and are the meaningful part, per house rules.
+## The incident: a forged PASS, and what it voided
 
-One incidental data point: the docs list GCC 14 as the tested
-toolchain with a claimed floor of 10.2. GCC 11.5 built the kernels,
-the patched fork, and both validation variants without a single source
-change, so the floor holds in practice, not just in the manual.
+The temperature-0 gate works by starting `llama-server` twice on a
+fixed port — once per build — and comparing greedy outputs. On this
+machine, an orphaned `llama-server` from the *previous day's* field
+session (started Jul 21 17:08, serving an unrelated 27B Q8_0 model)
+still held that port. Every subsequent gate run — the field session's
+later attempts and the first three runs of this validation — loaded
+its model, failed to bind, and died, while the health check and both
+completion requests were answered by the squatter. Two identical
+answers from one server: a PASS that validated nothing.
 
-## What ran
+Three details made it hard to see. The squatter kept writing its log
+into the same file each new server truncated, NUL-padding it into
+something `grep` calls binary. The generation text was a plausible
+completion of the gate's prompt. And `run_gen`'s `kill` — the thing
+that should have prevented the orphan from existing — had already
+succeeded in every observed run; the orphan came from a run that died
+between spawn and kill. The failure mode was invisible precisely
+where the script was looking.
 
-Three layers, in increasing order of integration:
+The harness now refuses to run if anything answers on its port,
+verifies after the health check that its own child process is the
+answerer (and, where `/props` exposes `model_path`, that the served
+model is the one under test), and verifies after each kill that the
+port actually died with the server. A squatted port is a loud FATAL,
+not a forged PASS. The banner check, which grepped the server log
+for an `MMA = 1` token this fork never prints (behind an `|| echo`
+fallback that could never fire), was replaced by counting GER
+instructions in the binaries: 496 `xvi8ger4`-family instructions in
+the native `libggml-cpu.so`, zero in the reference build.
 
-1. **Kernel suites, native.** `make CROSS= QEMU= test` — all 14
-   suites (13 plus the `IQGRID_PINGPONG` variant) against the exact
-   float64 references, compiled `-mcpu=power10`, executed on the MMA
-   engine itself rather than qemu's model of it. All passed;
-   normalized errors sit in the same 1e-7 to 2e-6 band the emulated
-   runs produce.
-2. **Patched fork build.** `scripts/build-bonsai-power.sh` — pinned
-   llama.cpp checkout, all nine patches applied in sequence with zero
-   rejects, `llama-cli`/`llama-server`/`llama-bench` built and linked.
-3. **The temperature-0 gate.** `scripts/validate-on-power.sh` with
-   `prism-ml/Ternary-Bonsai-1.7B-Q2_0.gguf` (qwen3-arch, 1.72 B
-   params, 436 MiB) — the full build-twice, generate-twice,
-   bench-twice protocol. Fork build `79697f23a (9595)`.
+## What ran, clean
 
-## Correctness: PASS, tier 1
+Kernel level first, then end to end. All native, GCC 11.5 (docs
+previously claimed GCC 14 tested; the 10.2 floor holds in practice).
 
-The MMA-native build and the `-mcpu=power9` reference build produced
-**token-identical output** — 32 greedy tokens, seed 42, temperature 0,
-same prompt. The gate's tier-2 near-tie certification never came into
-play; this is the strong verdict.
+1. **All 14 kernel suites** (`make CROSS= QEMU= test`) against exact
+   float64 references, on the MMA engine itself. All pass; errors in
+   the same 1e-7 to 2e-6 band as under emulation.
+2. **UBSan on silicon**: the qbit, q4_K, iq_grid, iq_grid_pp and
+   legacy suites rebuilt with `-fsanitize=undefined
+   -fno-sanitize-recover=all` and run natively. Clean. (Previously
+   emulation-only.)
+3. **The patch series**: applies in sequence with zero rejects at the
+   pinned commit; `llama-cli`/`llama-server`/`llama-bench` build.
+   Fork build `79697f23a (9595)`.
+4. **End-to-end gates** on four models chosen to cover the format
+   surface, run sequentially on an otherwise idle box:
 
-What that one comparison establishes, all at once: `xvi8ger4pp`
-behaves on silicon as the kernels assume (operand signedness, lane
-layout, accumulation); the decode-at-repack decoders agree with ggml's
-own dequantization; and the dispatch actually routes Q2_0 mat-muls
-through the MMA path end to end. Scope worth stating precisely: this
-run exercises the Q2_0 ternary kernels and the model's unquantized
-layers through the full stack. The other 24 formats are
-silicon-verified at kernel level (layer 1 above) but have not yet been
-driven end-to-end through a model.
+| model | formats inside (tensor census) | gate verdict |
+|---|---|---|
+| Ternary-Bonsai-1.7B Q2_0, 436 MiB | Q2_0 (qbit) | **PASS** — token-identical |
+| qwen3.5 27B Q4_K-Medium, 15.65 GiB | Q4_K + Q6_K | **PASS** — token-identical |
+| Qwen2.5-1.5B IQ3_XS, 692 MiB | IQ3_XXS ×98, IQ3_S ×70, Q4_K ×28, Q6_K embed | **PASS** — token-identical |
+| Qwen2.5-1.5B IQ2_M, 568 MiB | IQ2_S ×137, IQ3_S ×31, Q4_K ×28, Q5_K embed | tier-2 divergence → **certified benign** (below) |
 
-Because the fork's startup banner turned out not to print an `MMA =`
-flag (see field notes), MMA presence was verified at the binary level
-instead: `objdump -d build-mma/bin/libggml-cpu.so` contains **496**
-`xvi8ger4`-family instructions; the reference build contains **zero**.
+## The IQ2_M divergence, and what it actually was
 
-## Throughput
+IQ2_M diverged at token 5 with chosen-vs-alternative gaps of
+0.125/0.127 logprob against the gate's 0.10 near-tie tolerance — by
+the gate's stated rule, a numerical defect. Before accepting that,
+two experiments:
 
-`llama-bench`, same model, same partition, thread ladder 2/4/8.
-The reference build is the identical source tree with `-mcpu=power9`,
-which compiles out every `#if __MMA__` region — i.e. exactly the
-scalar/VSX vec_dot path a non-MMA build of this fork runs for Q2_0.
+**A pure-Q5_K probe.** The failing file's one non-IQ suspect was its
+Q5_K tied embedding — the output projection, m=151936, a shape no
+kernel suite reaches. A pure-Q5_K requant of the same base model
+(zero IQ tensors) *also* diverged (token 15, gaps 0.282/0.082). So
+either two unrelated format families broke the same way, or the gate
+was measuring something other than kernels.
 
-| threads | test | MMA t/s | reference t/s | ratio |
-|--:|---|--:|--:|--:|
-| 2 | pp128 | 116.65 ± 0.05 | 2.18 ± 0.00 | 53.5× |
-| 4 | pp128 | 219.95 ± 0.01 | 4.36 ± 0.00 | 50.4× |
-| 8 | pp128 | 417.72 ± 0.39 | 8.69 ± 0.01 | 48.1× |
-| 2 | tg32  | 8.50 ± 0.00   | 1.74 ± 0.00 | 4.9× |
-| 4 | tg32  | 16.69 ± 0.01  | 3.46 ± 0.00 | 4.8× |
-| 8 | tg32  | 30.97 ± 0.03  | 6.70 ± 0.13 | 4.6× |
+**A control with no kernels in it.** The same tree built twice more,
+`-mcpu=power8` vs `-mcpu=power9` — vanilla ggml both, no MMA, none of
+this repository's code — generating the same 64 greedy tokens on the
+same IQ2_M file:
 
-Two shapes in this table were predicted by the emulation-era analysis
-and are now confirmed by an instrument that can actually see them:
+| pair | diverges at | median \|Δlogprob\| over shared prefix |
+|---|---|---|
+| MMA ↔ power9 reference | token 5 | 0.122 |
+| **power9 ↔ power8 (no repo code)** | **token 7** | **0.110** |
+| MMA ↔ power8 | token 5 | 0.201 |
 
-- **Prompt processing vs generation.** ~50× on pp against ~5× on tg is
-  the bandwidth story BENCHMARKS-QEMU.md said qemu could not price:
-  batch mat-muls are compute-bound and the MMA engine eats them;
-  single-token generation is memory-bound, so the kernels win by less
-  and the remaining gap belongs to weight traffic, not arithmetic.
-- **Thread scaling.** The reference build scales perfectly linearly
-  (2.18 → 4.36 → 8.69, 3.99× over 2→8) because scalar code is
-  compute-starved and nowhere near the memory system's limits. The
-  MMA build scales at 3.58× over the same ladder — already brushing
-  bandwidth at 8 threads. Linear scaling in the slow build is not a
-  virtue; it is the signature of leaving the machine idle.
+Two builds containing none of this project's code flip a token and
+carry the same ~0.11 median drift as the MMA build. The divergence is
+this machine-pair's *cross-codegen rounding envelope* — compiler
+vectorization differences amplified through 28 transformer layers —
+and the MMA build sits inside it. The passing IQ3_XS run drifts just
+as much (median 0.113); it simply met no near-tie in 32 tokens. The
+27B and Bonsai passes are sharper-distribution models: fewer
+near-ties, so token identity survives the same drift.
 
-## What this closes in REVIEW.md, and what it does not
+Conclusion, stated carefully: **no evidence of a kernel defect; the
+gate's fixed tolerance was below the machine's own envelope, so its
+"real numerical defect" verdict overclaimed.** The gate now has a
+third tier: on a tier-2 divergence it builds the power8 control,
+measures the envelope, and confirms FAIL only if the MMA build's
+drift exceeds twice what two MMA-free builds do to each other.
+Re-running IQ2_M under the three-tier gate: **PASS (codegen
+envelope)** — MMA-vs-reference median drift 0.114 against an MMA-free
+control envelope of 0.072, with the control pair itself flipping a
+token.
 
-Three rows of the verification matrix were waiting on hardware:
+What tier 3 does *not* do is independently verify the grid decoders —
+REVIEW.md's matrix row for that stays open, and an exhaustive
+decoder-vs-`dequantize_row` cross-check remains the right follow-up.
 
-- *End-to-end inference numerics through patched dispatch* — *verified*
-  for the Q2_0 path by the tier-1 token identity above.
-- *Decoders vs ggml's dequantization* — the same run covers the Q2_0
-  decoder independently; the grid/codebook decoders remain
-  consistency-checked only, pending end-to-end runs on models that use
-  them.
-- *Performance on silicon* — first real datapoint, this page.
+## Throughput: hardware picked two winners and one loser
 
-Still open: end-to-end runs for the remaining formats (a K-quant model
-and an IQ-grid model would cover most of the surface), UBSan on
-silicon (emulation-only so far), and the `IQGRID_PINGPONG` A/B that
-this repo has been explicitly saving for hardware — the bench above
-does not exercise the grid kernels at all.
+`llama-bench`, MMA vs power9 reference, 8-thread rows (full 2/4/8
+ladders in the archived reports; ratios hold across the ladder):
+
+| model | pp128 MMA | pp128 ref | pp ratio | tg32 MMA | tg32 ref | tg ratio |
+|---|--:|--:|--:|--:|--:|--:|
+| Q2_0 1.7B (qbit) | 403.7 | 8.7 | **46×** | 30.3 | 6.8 | **4.4×** |
+| Q4_K 27B | 22.3 | 5.9 | **3.8×** | 1.41 | 3.90 | **0.36×** |
+| IQ2_M 1.5B | 172.8 | 41.4 | **4.2×** | 4.18 | 32.6 | **0.13×** |
+| IQ3_XS 1.5B | 228.4 | 32.7 | **7.0×** | 4.28 | 26.5 | **0.16×** |
+
+Prompt processing: the MMA engine wins everywhere, 4× to 46×. Token
+generation splits into two regimes:
+
+- **qbit formats win tg** (4.4×): v4 has a dedicated no-packing GEMV
+  path that reads weights at their native 1–2 bits per element.
+- **Packed-cache formats lose tg**, 2.8× (Q4_K) to 7.8× (IQ2_M),
+  against ggml's own VSX vec_dot. The signature is diagnostic: MMA
+  tg is ~1.1/2.2/4.2 t/s at 2/4/8 threads for *both* IQ models
+  regardless of their size — linear thread scaling, far below
+  bandwidth (4.18 t/s × 568 MiB ≈ 2.4 GB/s) — i.e. compute-bound on
+  per-token pack/decode work in the n=1 path, not memory-bound
+  inference. The qbit GEMV design is the proven in-repo fix pattern;
+  extending it to the K-quant and grid kernels is now the top
+  performance work item, and no deployment serving generation-heavy
+  traffic should ship the MMA build for these formats until it lands.
+
+This is exactly the class of result emulation could not price, and it
+cuts both ways: the 46× pp win and the 7.8× tg loss were equally
+invisible to instruction counting.
+
+## IQGRID_PINGPONG: hardware picked the winner, barely
+
+The A/B this repo saved for silicon (`-DIQGRID_PINGPONG`, patch
+0010): both variants built (xxmfacc count 165 vs 197 — the double
+accumulator set is really there) and benched on both IQ models.
+Result: ping-pong gains 3–4% in generation on IQ3_XS (4.38 vs 4.22
+t/s at 8t, outside noise), costs 1–5% in prompt processing (61.1 vs
+64.5 t/s at 2t), and moves IQ2_M by less than ±1% anywhere. The 3%
+static-instruction cost predicted in DESIGN.md shows up in pp almost
+exactly as counted; the engine-idle removal is real but small at this
+scale. **Standard stays the default.** The A/B should be repeated
+once the GEMV work lands, since tg is where ping-pong helps and tg is
+currently dominated by the pack overhead above.
 
 ## Field notes
 
-Honest small findings from the first contact, in the spirit of the
-defect log:
-
-- The script's "MMA active in native build" check cannot report
-  absence: `grep … | head -1 || echo …` never triggers the fallback
-  because `head` exits 0 regardless, and this fork's `system_info`
-  line has no `MMA =` token to find in the first place (it prints
-  `VSX = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1`). The objdump
-  count above is the robust replacement and should probably become the
-  scripted check.
-- The report's `Repo:` field renders empty when the tree is deployed
-  without `.git` (as it was here, via tar). Cosmetic, but the field
-  exists to pin provenance, so it failed at its one job.
-- The correctness-gate servers ran single-threaded (the fork's
-  `llama-server` default on this box). Irrelevant to the verdict —
-  token identity does not depend on thread count — but it explains why
-  each generation took ~a minute despite the bench numbers above.
-- `/tmp` on the test box still held outputs from the 2026-07-21 field
-  session (the one that produced the "field FAIL" fixes in the git
-  log). The script truncates and rewrites its files, so stale state
-  cannot leak into the gate — verified by timestamp before trusting
-  the run.
+- The orphaned-server incident above is the headline entry; the
+  repo's own prior "field FAIL" analysis from Jul 21 was reasoning
+  about outputs that the squatter generated. Conclusions drawn from
+  that session should be re-examined.
+- `validate-on-power.sh` exits 0 even when the gate fails; the runner
+  driving sequential validations had to grep verdicts out of logs.
+  An exit code would be kinder to CI.
+- The report's `Repo:` field is empty when the tree is deployed
+  without `.git`. It exists to pin provenance; it failed at its one
+  job and should fall back to something.
+- `/tmp` artifact files are overwritten by every run; the failing
+  IQ2_M evidence was lost to the next run's truncation and had to be
+  regenerated. Runs should archive their artifacts under a per-run
+  directory.
+- The 16.8 GB file named `qwen3.6-q4.gguf` on the test box is
+  actually qwen3.5 27B Q4_K-Medium per its own metadata. Filenames
+  lie; tensor censuses do not.
 
 ## Reproducing
 
 ```
 scripts/build-bonsai-power.sh
-scripts/validate-on-power.sh /path/to/Ternary-Bonsai-1.7B-Q2_0.gguf
+scripts/validate-on-power.sh /path/to/model.gguf
 ```
 
-Twenty minutes on this partition, most of it the two builds. The
-script emits `validation-report.md`; this page is that report with its
-context filled in.
+The gate is now three-tier: token identity, then near-tie
+certification, then the power8 codegen-envelope control (built on
+demand, a few extra minutes, only on divergence). A squatted port or
+a GER-free "MMA" build aborts loudly. Twenty minutes per model on
+this partition, most of it the two builds.

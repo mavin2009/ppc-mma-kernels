@@ -20,9 +20,10 @@ that has never found a defect in itself hasn't looked.
 | Integer overflow in GER accumulation | Bounds analysis: max chunk dot ≪ 2³¹ for every format | Verified by analysis |
 | Patch-series integrity (0001–0014) | Sequential `git apply` gate on a pristine checkout of the pinned base; result diffed against the build-verified tree | Verified, byte-identical |
 | Fork integration compiles + links | ppc64le cross-build, GCC 14, all 10 kernel TUs in ggml-cpu; `llama-cli` executes under qemu | Verified |
-| End-to-end inference numerics through patched dispatch | Requires model weights + hardware | **NOT verified** — DEPLOY.md step 5 is mandatory before production |
-| Grid/ternary/codebook decoders vs ggml's dequantization | Test refs share the decoders (consistency only); decoders are line-by-line ports | **NOT independently verified** — covered by the same step 5 |
-| Performance on silicon | qemu is an instruction-count proxy; static accounting is exact but prices nothing | **NOT verified** — every performance statement is labeled with its instrument |
+| End-to-end inference numerics through patched dispatch | Temp-0 gates on POWER10 hardware, four models spanning Q2_0, Q4_K/Q6_K, Q5_K, IQ2_S/IQ3_S/IQ3_XXS | Verified (token identity, or certified within the measured cross-codegen envelope; VALIDATION-POWER10.md) |
+| Grid/ternary/codebook decoders vs ggml's dequantization | Test refs share the decoders (consistency only); decoders are line-by-line ports | **NOT independently verified** — E2E gates now exercise IQ2_S/IQ3_S/IQ3_XXS through ggml's own activation path, but an exhaustive decoder-vs-`dequantize_row` cross-check is still the right tool |
+| Performance on silicon | `llama-bench`, MMA vs `-mcpu=power9` reference, same LPAR | Measured — pp 4–46× faster; tg 4.4× faster (qbit) but **2.8–7.8× slower for packed-cache formats** (open work item; VALIDATION-POWER10.md) |
+| UBSan on silicon | Native rebuild of qbit/q4_K/iq_grid/iq_grid_pp/legacy suites with `-fsanitize=undefined` | Clean |
 
 ## Defects this project found in itself
 
@@ -49,6 +50,22 @@ Disclosed here deliberately; each one changed a process, not just a line.
 - **Silent-failure path.** Early one-shot drivers returned quietly on
   allocation failure while the dispatch reported success. Now aborts
   loudly (patch 0006).
+- **Forged hardware PASS (validation harness).** The temp-0 gate
+  trusted a fixed port: an orphaned llama-server from a previous
+  session answered both builds' requests, making the outputs
+  trivially identical and voiding every gate verdict for a day —
+  including this repo's first published hardware PASS. The harness
+  now treats a squatted port as FATAL, asserts its own child is the
+  answerer, and verifies the port dies with each kill. The lesson
+  generalizes: a comparison gate must prove *what* it compared, not
+  just that the comparison matched (VALIDATION-POWER10.md).
+- **Gate tolerance overclaimed in the other direction.** The near-tie
+  tier's fixed 0.10-logprob tolerance sat below the machine's real
+  cross-codegen rounding envelope (~0.11 median between two MMA-free
+  builds of the same tree), so genuine rounding drift was reported as
+  "a real numerical defect." The gate now measures the envelope with
+  a `-mcpu=power8` control build before confirming any FAIL. A gate
+  that can only false-PASS or only false-FAIL is half a gate.
 - Two git recovery commits from process mistakes remain in history
   with honest messages; the test matrix, not the history, is the
   arbiter of code state.

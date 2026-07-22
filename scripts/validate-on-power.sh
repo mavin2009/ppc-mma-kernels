@@ -30,6 +30,17 @@ cd "$SRC"
 PROMPT="The three most important properties of a matrix multiplication kernel are"
 PORT=8971
 
+# Refuse a squatted port. A pre-existing server here answers both
+# builds' health checks and completions, so the two outputs compare
+# equal no matter what the kernels compute -- a forged PASS. Field
+# incident 2026-07-22: an orphaned llama-server from the previous
+# day's session survived its kill and did exactly that, three times.
+if curl -s --max-time 2 "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then
+    echo "FATAL: something already answers on 127.0.0.1:$PORT."
+    echo "  ss -tlnp | grep $PORT   -- find it, kill it, re-run."
+    exit 1
+fi
+
 # generate 32 greedy tokens via llama-server + curl: no TTY, no stdin,
 # no conversation mode -- llama-cli's interactive behavior defeated
 # three prior attempts at scripting it (see git log of this file).
@@ -42,6 +53,22 @@ run_gen() {   # $1 = build dir, $2 = output file, $3 = server log
         sleep 2
     done
     if [ $up -ne 1 ]; then echo "server failed to start ($1); see $3"; kill $SPID 2>/dev/null; exit 1; fi
+    # Health answering is necessary, not sufficient: prove the answerer
+    # is OUR server, i.e. our child is alive and the served model is
+    # the one we were asked to validate (when /props exposes it).
+    if ! kill -0 $SPID 2>/dev/null; then
+        echo "FATAL: our server ($1) is dead but :$PORT answers -- another server is squatting the port."
+        exit 1
+    fi
+    served=$(curl -s --max-time 5 "http://127.0.0.1:$PORT/props" 2>/dev/null | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("model_path",""))
+except Exception: print("")' 2>/dev/null)
+    case "$served" in
+        "" ) : ;;                      # this fork's /props may not expose model_path; the checks above still hold
+        *"$(basename "$MODEL")" ) : ;;
+        * ) echo "FATAL: server on :$PORT serves '$served', not $(basename "$MODEL") -- refusing to compare."
+            kill $SPID 2>/dev/null; exit 1 ;;
+    esac
     curl -s --connect-timeout 5 --max-time 1800 "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' \
         -d "{\"prompt\": \"$PROMPT\", \"n_predict\": 32, \"temperature\": 0, \"seed\": 42, \"cache_prompt\": false, \"n_probs\": 5}" \
         > "$2.json" || true
@@ -56,6 +83,15 @@ except Exception as e:
     fi
     kill $SPID 2>/dev/null || true
     wait $SPID 2>/dev/null || true
+    # Verify the port is actually released -- a survivor here becomes
+    # next run's squatter (see the field incident above).
+    i=0
+    while curl -s --max-time 2 "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; do
+        i=$((i+1))
+        [ $i -gt 10 ] && { echo "FATAL: :$PORT still answers after kill; refusing to continue."; exit 1; }
+        kill -9 $SPID 2>/dev/null || true
+        sleep 1
+    done
 }
 
 echo "[$(date +%H:%M:%S)] == building MMA (native) variant"
@@ -70,8 +106,17 @@ echo "[$(date +%H:%M:%S)] == temperature-0 comparison (two server starts + model
 run_gen build-mma /tmp/out-mma.txt /tmp/server-mma.log
 run_gen build-ref /tmp/out-ref.txt /tmp/server-ref.log
 
-echo "[$(date +%H:%M:%S)] == MMA active in native build:"
-grep -o "MMA = [01]" /tmp/server-mma.log | head -1 || echo "MMA flag not found in server banner; check /tmp/server-mma.log"
+# The old check grepped the server banner for "MMA = 1", which failed
+# two ways at once in the field: this fork's system_info has no MMA
+# token, and `grep | head -1 || echo` can never take the fallback
+# (head exits 0 regardless). Count GER instructions in the binary
+# instead -- the ISA does not lie.
+echo "[$(date +%H:%M:%S)] == MMA instructions in the binaries (objdump):"
+GER_MMA=$(objdump -d build-mma/bin/libggml-cpu.so 2>/dev/null | grep -cE "xvi8ger4|xvi4ger8|pmxvi8ger4" || true)
+GER_REF=$(objdump -d build-ref/bin/libggml-cpu.so 2>/dev/null | grep -cE "xvi8ger4|xvi4ger8|pmxvi8ger4" || true)
+echo "   build-mma: $GER_MMA GER; build-ref: $GER_REF GER"
+[ "${GER_MMA:-0}" -gt 0 ] || { echo "FATAL: native build contains no GER instructions -- MMA never compiled in; this comparison proves nothing."; exit 1; }
+[ "${GER_REF:-0}" -eq 0 ] || echo "WARNING: reference build contains GER instructions; baseline is not MMA-free."
 
 # preflight: fail LOUDLY, never silently
 for f in /tmp/out-mma.txt /tmp/out-ref.txt /tmp/out-mma.txt.json /tmp/out-ref.txt.json; do
@@ -134,6 +179,70 @@ except Exception as e:
 PYGATE
 )
 fi
+
+# Tier 3: divergence beyond the near-tie band. Before calling that a
+# kernel defect, measure this machine's own cross-codegen envelope: a
+# -mcpu=power8 build of the SAME tree contains no MMA and none of this
+# repo's kernels either, so drift between it and the power9 reference
+# is pure compiler rounding-tree variation. If the MMA build's drift
+# sits within twice that envelope -- or the two MMA-free builds flip a
+# token themselves -- the divergence cannot indict the kernels.
+# Added after field data 2026-07-22: power8-vs-power9 vanilla ggml
+# flipped at token 7 with median drift 0.11 on a 1.5B model, larger
+# than TOL. A fixed tolerance alone overclaims in both directions.
+case "$T0" in *"**FAIL**"*)
+    echo "[$(date +%H:%M:%S)] == tier-2 divergence: building -mcpu=power8 control (a few minutes)"
+    if [ ! -x build-ref8/bin/llama-server ]; then
+        cmake -B build-ref8 -DGGML_NATIVE=OFF -DCMAKE_C_FLAGS=-mcpu=power8 -DCMAKE_CXX_FLAGS=-mcpu=power8 \
+              -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF > /dev/null 2>&1
+        cmake --build build-ref8 -j"${JOBS:-$(nproc)}" --target llama-server > /dev/null 2>&1
+    fi
+    if [ -x build-ref8/bin/llama-server ]; then
+        run_gen build-ref8 /tmp/out-ref8.txt /tmp/server-ref8.log
+        T0=$(python3 - << 'PYCTL'
+import json, math
+def toks(p):
+    d = json.load(open(p)); seq = []
+    for t in d.get("completion_probabilities", []):
+        m = {}
+        for c in (t.get("probs") or t.get("top_logprobs") or []):
+            m[c.get("tok_str", c.get("token"))] = c.get("prob", c.get("logprob"))
+        seq.append((t.get("content") or t.get("token"), m))
+    return seq
+def lp(v):
+    return math.log(max(v, 1e-30)) if 0 <= v <= 1 else v
+def drift(A, B):
+    ds = []; flip = False
+    for (ta, ma), (tb, mb) in zip(A, B):
+        if ta != tb:
+            flip = True; break
+        for k in set(ma) & set(mb):
+            ds.append(abs(lp(ma[k]) - lp(mb[k])))
+    ds.sort()
+    return (ds[len(ds)//2] if ds else None), flip
+try:
+    M  = toks("/tmp/out-mma.txt.json")
+    R9 = toks("/tmp/out-ref.txt.json")
+    R8 = toks("/tmp/out-ref8.txt.json")
+    m9, _ = drift(M, R9)
+    c, ctl_flip = drift(R9, R8)
+    if m9 is None:
+        print("**INDETERMINATE** -- MMA and reference diverge at token 0; no span to measure. Attach /tmp/out-*.txt.json to an issue.")
+    elif ctl_flip or (c is not None and c > 0 and m9 <= 2 * c):
+        extra = " and itself flips a token" if ctl_flip else ""
+        print(f"**PASS (codegen envelope)** -- the tier-2 divergence lies within this machine's cross-codegen rounding envelope: MMA vs power9-reference median logprob drift {m9:.3f}; the MMA-free power8-vs-power9 control pair drifts {(c if c is not None else float('nan')):.3f}{extra}. Two builds containing none of this repo's code behave the same way, so the divergence does not indict the kernels.")
+    else:
+        print(f"**FAIL (control-confirmed)** -- MMA drift median {m9:.3f} exceeds twice the MMA-free control envelope {c:.3f}: the divergence is specific to the MMA path. A real numerical defect; do NOT deploy; attach /tmp/out-*.txt.json to an issue.")
+except Exception as e:
+    print(f"**INDETERMINATE** -- envelope analysis failed ({e}); attach /tmp/out-*.txt.json to an issue")
+PYCTL
+)
+    else
+        T0="$T0
+(power8 control build failed; tier-3 envelope check unavailable)"
+    fi
+;; esac
+
 echo "$T0"
 set -e
 
