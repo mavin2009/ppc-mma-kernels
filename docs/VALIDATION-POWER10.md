@@ -89,9 +89,11 @@ carry the same drift (IQ3_XS: 0.113) — they simply met no near-tie.
 The envelope is a property of compiler codegen variation amplified
 through 28 transformer layers, not of these kernels.
 
-What tier 3 does **not** establish: independent verification of the
-grid decoders against ggml's `dequantize_row` family. That row of
-REVIEW.md's matrix stays open (next step N1).
+What tier 3 does **not** establish by itself: independent
+verification of the grid decoders against ggml's `dequantize_row`
+family. That gap is now closed separately by the N1 cross-check
+(`make test-xcheck`), which proves the decoders bit-exact at unit
+level.
 
 ## 4. Defects found, fixed, verified
 
@@ -169,9 +171,9 @@ side of this A/B is live; revisit under N4.
   yet end-to-end: Q2_K, Q3_K, Q4_1, Q5_0, Q5_1, IQ4_NL, IQ4_XS,
   IQ1_S/M, IQ2_XXS/XS, TQ1_0, TQ2_0, MXFP4, NVFP4 (all remain
   silicon-verified at kernel level only).
-- **Decoders are not independently cross-checked** against ggml's
-  `dequantize_row` (unit level); end-to-end gates cover them only
-  indirectly.
+- ~~Decoders not independently cross-checked~~ Closed by N1: all 13
+  grid/ternary/codebook decoders are now bit-exact against ggml's
+  `dequantize_row_*` at unit level (`make test-xcheck`).
 - **One machine, one compiler.** The envelope constants (0.10
   tolerance, 2× control factor) are calibrated to this LPAR/GCC-11.5
   pair; a second machine should confirm they generalize. Power11 is
@@ -185,7 +187,7 @@ side of this A/B is live; revisit under N4.
 
 | # | action | why | done when |
 |---|---|---|---|
-| N1 | Exhaustive decoder cross-check: repo decoders vs ggml `dequantize_row_*` over full code/grid space per format | Closes the last open correctness row in REVIEW.md; D2 cleared the decoders statistically, not exhaustively | Harness in `make test`, all formats bit-exact or discrepancies explained |
+| N1 | ~~Exhaustive decoder cross-check~~ **DONE 2026-07-22**: `make test-xcheck` — every grid/sign/value table memcmp'd against ggml's originals (vendored verbatim from the pinned fork, `scripts/extract-xcheck-ref.py`); block dequant bit-exact across all 13 formats (~7.6M elements, maxrel = 0); mutation test proves the gate can fail | Closes the last open correctness row in REVIEW.md | ✅ In `make test`; all formats bit-exact, run natively on POWER10 |
 | N2 | End-to-end gates for uncovered families — TQ1/TQ2 (ternary GGUFs), IQ1/IQ2-XXS/XS (imatrix quants), MXFP4/NVFP4, legacy Q4_1/Q5_0/Q5_1 and Q2_K/Q3_K (requant probes suffice; determinism is what's tested) | §6 coverage gap; three-tier gate makes each run ~20 min | Every format family has a gate verdict in this table |
 | N3 | Cache hardening: slot count sized from tensor count (or startup warning on overflow) + regression test at N > capacity | D3's lesson — twice a cache policy fix shipped with its own sequel; a test, not a review, catches the third | Test in CI that fails when any tensor is silently uncached |
 | N4 | Measure, then decide on low-bit MMA GEMV: profile whether vec_dot tg is compute-bound anywhere that matters (SMT ladder, Power11, weak-vec_dot formats) | tg headroom only exists where the bandwidth argument in §6 breaks; build nothing on a hunch | Profile data per format; GEMV built only for formats it can win |

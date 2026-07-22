@@ -42,6 +42,10 @@ PROD_TESTS := \
 	$(BUILD)/q5_k_test $(BUILD)/q6_k_test \
 	$(BUILD)/iq4_test $(BUILD)/legacy_test $(BUILD)/iq_grid_test $(BUILD)/iq_grid_pp_test
 
+# ---- independent decoder cross-checks (vs vendored ggml dequantize_row) ----
+XCHECK_TESTS := \
+	$(BUILD)/xcheck_grid $(BUILD)/xcheck_iq4
+
 # ---- reference (design-history) suites ----
 REF_TESTS := \
 	$(BUILD)/ref_q1_v1_test $(BUILD)/ref_q2_v1_test \
@@ -49,7 +53,7 @@ REF_TESTS := \
 
 BENCH := $(BUILD)/qbit_bench $(BUILD)/ref_q1_v2_bench $(BUILD)/ref_qbit_v3_bench
 
-all: $(PROD_TESTS) $(REF_TESTS) $(BENCH)
+all: $(PROD_TESTS) $(XCHECK_TESTS) $(REF_TESTS) $(BENCH)
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -86,6 +90,16 @@ $(BUILD)/iq_grid_test: src/iq_grid_ppc_mma.cpp src/iq_grids.h | $(BUILD)
 $(BUILD)/iq_grid_pp_test: src/iq_grid_ppc_mma.cpp src/iq_grids.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -DIQGRID_TEST -DIQGRID_PINGPONG $< -o $@
 
+# ---- decoder cross-checks: repo decoders vs ggml's dequantize_row,
+# vendored verbatim from the pinned fork (scripts/extract-xcheck-ref.py).
+# -Wno-unused-function: each harness uses only its slice of the included
+# kernel TU and reference surface.
+$(BUILD)/xcheck_grid: src/xcheck_grid.cpp src/iq_grid_ppc_mma.cpp src/iq_grids.h src/xcheck_ggml_ref.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -Wno-unused-function $< -o $@
+
+$(BUILD)/xcheck_iq4: src/xcheck_iq4.cpp src/iq4_ppc_mma.cpp src/xcheck_ggml_ref.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -Wno-unused-function $< -o $@
+
 $(BUILD)/qbit_bench: src/qbit_ppc_mma_v4.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) -DQBIT4_BENCH $< -o $@
 
@@ -109,9 +123,13 @@ $(BUILD)/ref_qbit_v3_bench: src/reference/qbit_ppc_mma_v3.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) -DQBIT_BENCH $< -o $@
 
 # ---- entry points ----
-test: $(PROD_TESTS) $(REF_TESTS)
-	@for t in $(PROD_TESTS) $(REF_TESTS); do echo "== $$t"; $(QEMU) ./$$t || exit 1; done
+test: $(PROD_TESTS) $(XCHECK_TESTS) $(REF_TESTS)
+	@for t in $(PROD_TESTS) $(XCHECK_TESTS) $(REF_TESTS); do echo "== $$t"; $(QEMU) ./$$t || exit 1; done
 	@echo "ALL SUITES PASSED"
+
+test-xcheck: $(XCHECK_TESTS)
+	@for t in $(XCHECK_TESTS); do echo "== $$t"; $(QEMU) ./$$t || exit 1; done
+	@echo "ALL DECODER CROSS-CHECKS PASSED"
 
 test-production: $(PROD_TESTS)
 	@for t in $(PROD_TESTS); do echo "== $$t"; $(QEMU) ./$$t || exit 1; done
@@ -130,6 +148,7 @@ help:
 	@echo "  make test              build + run all correctness suites (production + reference)"
 	@echo "  make test-production   only the 9 production suites (what the patches integrate)"
 	@echo "  make test-reference    only the v1-v3 design-history suites"
+	@echo "  make test-xcheck       decoder cross-checks vs vendored ggml dequantize_row"
 	@echo "  make bench             qemu instruction-count proxy benchmarks"
 	@echo "  make all               build everything without running"
 	@echo "  make clean             remove build/"
