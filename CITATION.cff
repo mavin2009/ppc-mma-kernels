@@ -6,4 +6,5 @@ authors:
     given-names: Michael
 repository-code: "https://github.com/mavin2009/ppc-mma-kernels"
 license: MIT
-version: 0.9.0
+version: 1.0.0
+date-released: 2026-07-22

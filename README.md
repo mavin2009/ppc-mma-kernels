@@ -64,21 +64,28 @@ every fixup. There is a compile-flag variant (IQGRID_PINGPONG) that
 alternates two accumulator sets so the next chunk's GERs issue before
 the previous chunk drains. It costs a measured three percent in static
 instructions and buys engine-idle removal that no instruction count
-can see. Both variants are in the test matrix. Hardware will pick the
-winner, not me.
+can see. Both variants are in the test matrix, and hardware has now
+picked the winner: standard, barely — ping-pong's 3% instruction cost
+shows up in prompt processing almost exactly as counted, and its
+small generation edge was mooted when patch 0015 handed small-n work
+back to vec_dot. The A/B is in VALIDATION-POWER10.md and is worth
+re-running if a true low-bit GEMV ever puts generation back on the
+MMA path.
 
 ## What is verified, and what is not
 
 Correctness is proven the boring way: thirteen kernel suites (fourteen
 counting the ping-pong variant) against exact float64 references on
-random data, ragged shapes, multi-slab depths and n=1, all run under
-qemu-power10, built with -Wall -Wextra -Werror, with UBSan clean on
-the gnarliest suites. The nine integration patches are gated: every
-push proves the series applies in sequence on a pristine checkout of
-the pinned fork commit and reproduces the build-verified tree byte for
-byte. I added that gate after shipping a broken series once. The
-defect log in docs/REVIEW.md is honest about that and about the other
-things I got wrong, because a repo that has never found a defect in
+random data, ragged shapes, multi-slab depths and n=1, built with
+-Wall -Wextra -Werror — run under qemu-power10 on every push and now
+also natively on POWER10, where all suites and UBSan come up clean.
+The fifteen integration patches are gated: every push proves the
+series applies in sequence on a pristine checkout of the pinned fork
+commit and reproduces the build-verified tree byte for byte. I added
+that gate after shipping a broken series once. The defect log in
+docs/REVIEW.md is honest about that and about the other things I got
+wrong — the two validation-harness defects hardware exposed are its
+newest entries — because a repo that has never found a defect in
 itself has not looked.
 
 The first hardware validation ran on 2026-07-22 on a POWER10 LPAR:
@@ -96,11 +103,12 @@ signature and fixed the same day (patch 0015: bigger cache, and
 below one column tile the dispatch hands generation back to
 vec_dot). Post-fix, generation is at reference parity or better for
 every format tested and qbit formats keep their 4.4× win. Emulation
-priced none of this; that is why 0.9.0 was labeled
-emulation-verified and why the validation script exists. If you have
-a Power10 or Power11 machine, scripts/validate-on-power.sh runs the
-whole protocol — now a three-tier gate with a codegen-envelope
-control — and hands you a report to paste into an issue.
+priced none of this, which is why 0.9.0 was labeled
+emulation-verified, why 1.0.0 was reserved for silicon, and why 1.0.0
+is now real. If you have a Power10 or Power11 machine —
+especially a Power11 — scripts/validate-on-power.sh runs the whole
+protocol, now a three-tier gate with a codegen-envelope control, and
+hands you a report to paste into an issue.
 
 ## Layout and use
 
