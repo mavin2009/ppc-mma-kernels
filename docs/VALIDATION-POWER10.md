@@ -18,7 +18,7 @@ void (defect D1). Nothing below rests on the invalidated runs.
 |---|---|
 | Machine | IBM 9105-42A (Power S1022) LPAR, POWER10 architected, 8 hw threads, 123 GiB RAM |
 | OS / toolchain | RHEL 9.7, kernel 5.14.0-611.42.1.el9_7.ppc64le, GCC 11.5.0, cmake 3.31 |
-| Fork | pinned commit `79697f23a (9595)`, patches 0001–0015 applied, zero rejects |
+| Fork | pinned commit `79697f23a (9595)`, patches 0001–0016 applied, zero rejects |
 | Builds | `build-mma` (GGML_NATIVE), `build-ref` (`-mcpu=power9`, MMA compiled out), `build-ref8` (`-mcpu=power8`, gate control) |
 | MMA presence | objdump: 496 `xvi8ger4`-family instructions in native `libggml-cpu.so`, 0 in reference |
 
@@ -166,11 +166,10 @@ side of this A/B is live; revisit under N4.
 
 ## 6. Limitations
 
-- **End-to-end format coverage is partial:** Q2_0, Q4_K, Q5_K, Q6_K,
-  IQ2_S, IQ3_S, IQ3_XXS have been driven through real models. Not
-  yet end-to-end: Q2_K, Q3_K, Q4_1, Q5_0, Q5_1, IQ4_NL, IQ4_XS,
-  IQ1_S/M, IQ2_XXS/XS, TQ1_0, TQ2_0, MXFP4, NVFP4 (all remain
-  silicon-verified at kernel level only).
+- ~~End-to-end format coverage is partial~~ Closed by the N2 sweep
+  (§8): every accelerated format is silicon-verified end-to-end
+  except MXFP4 and NVFP4, which cannot be produced by requantization
+  in this fork and remain kernel-level + N1-decode-verified.
 - ~~Decoders not independently cross-checked~~ Closed by N1: all 13
   grid/ternary/codebook decoders are now bit-exact against ggml's
   `dequantize_row_*` at unit level (`make test-xcheck`).
@@ -188,13 +187,65 @@ side of this A/B is live; revisit under N4.
 | # | action | why | done when |
 |---|---|---|---|
 | N1 | ~~Exhaustive decoder cross-check~~ **DONE 2026-07-22**: `make test-xcheck` — every grid/sign/value table memcmp'd against ggml's originals (vendored verbatim from the pinned fork, `scripts/extract-xcheck-ref.py`); block dequant bit-exact across all 13 formats (~7.6M elements, maxrel = 0); mutation test proves the gate can fail | Closes the last open correctness row in REVIEW.md | ✅ In `make test`; all formats bit-exact, run natively on POWER10 |
-| N2 | End-to-end gates for uncovered families — TQ1/TQ2 (ternary GGUFs), IQ1/IQ2-XXS/XS (imatrix quants), MXFP4/NVFP4, legacy Q4_1/Q5_0/Q5_1 and Q2_K/Q3_K (requant probes suffice; determinism is what's tested) | §6 coverage gap; three-tier gate makes each run ~20 min | Every format family has a gate verdict in this table |
-| N3 | Cache hardening: slot count sized from tensor count (or startup warning on overflow) + regression test at N > capacity | D3's lesson — twice a cache policy fix shipped with its own sequel; a test, not a review, catches the third | Test in CI that fails when any tensor is silently uncached |
-| N4 | Measure, then decide on low-bit MMA GEMV: profile whether vec_dot tg is compute-bound anywhere that matters (SMT ladder, Power11, weak-vec_dot formats) | tg headroom only exists where the bandwidth argument in §6 breaks; build nothing on a hunch | Profile data per format; GEMV built only for formats it can win |
-| N5 | Harness polish: nonzero exit on gate FAIL, per-run artifact directory (evidence was lost to `/tmp` truncation during D2's diagnosis), `Repo:` provenance fallback without `.git` | CI-usability + the diagnosis friction encountered this session | Script exits 1 on FAIL; artifacts survive consecutive runs |
+| N2 | ~~End-to-end gates for uncovered families~~ **DONE 2026-07-22**: 14 requant probes, all PASS across tiers 1–3, zero kernel defects (§8); MXFP4/NVFP4 unreachable by requant, documented | §6 coverage gap | ✅ §8 table |
+| N3 | ~~Cache hardening~~ **DONE 2026-07-22** (patch 0016): slot table grows — slot count can never bind; refusals counted and loud; stats API; canonical copy lives in src/ppc_pack_cache.cpp with xcheck_cache driving the N > capacity regime in `make test` | D3's lesson — a test, not a review, catches the third sequel | ✅ Test in `make test`; silence is structurally impossible |
+| N4 | ~~Measure, then decide on low-bit MMA GEMV~~ **DONE 2026-07-22**: triad ceiling 133 GB/s vs per-format effective bandwidth (§9). Decision: build direct GEMV for IQ1_S/M + TQ1_0 (5–10x plausible), consider IQ2/IQ3/TQ2_0 (2–4x), skip the rest | build nothing on a hunch | ✅ §9 table; GEMV implementation is the one open engineering item |
+| N5 | ~~Harness polish~~ **DONE 2026-07-22**: exit 0/1/2 mirrors the gate; per-run artifact dirs under validation-runs/; `Repo:` falls back to a source sha without `.git`; tier 3 can now certify token-0 divergences from position-0 candidate drift | CI-usability + D2's diagnosis friction | ✅ Smoke-tested on silicon (exit 0, artifacts archived) |
 | N6 | Second machine: Power11 (or a differently-entitled POWER10 LPAR) full protocol run | §6 single-machine limitation; README solicits reports | A second report alongside this one |
 
-## 8. Reproducing
+## 8. Format-coverage sweep (N2, 2026-07-22 evening)
+
+Every format family the fork can produce was driven through the
+three-tier gate as a requant probe (quality irrelevant — the gate
+tests determinism). Sources: the 1.5B IQ3_XS for well-conditioned
+targets; the Bonsai F16 with a fresh imatrix for the fussy low-bit
+ones, after `--pure` requants of a requant crashed IQ quantization
+itself (`ggml_quantize_chunk` abort — a probe-construction lesson,
+not a kernel issue).
+
+| probe | gate verdict | tier |
+|---|---|---|
+| Q2_K | PASS token-identical | 1 |
+| Q3_K_M (Q3_K + mixture) | PASS | 3 (envelope) |
+| Q4_1 | PASS | 3 (envelope) |
+| Q5_0, Q5_1 | PASS token-identical | 1 |
+| IQ4_NL, IQ4_XS | PASS | 3 (envelope) |
+| TQ1_0, TQ2_0 | PASS | 3 (envelope) |
+| IQ1_S | PASS near-tie (0.0000 gap) | 2 |
+| IQ1_M | PASS near-tie (0.0000 gap) | 2 |
+| IQ2_XXS, IQ2_XS | PASS token-identical | 1 |
+| Q8_0 (via MXFP4_MOE fallback) | PASS near-tie (0.014) | 2 |
+
+Combined with §2, every quantized format this project accelerates is
+now silicon-verified end-to-end **except MXFP4 and NVFP4**, which the
+fork cannot produce by requantization (MXFP4_MOE falls back to Q8_0
+on dense models; NVFP4 has no quantize target). Those two remain
+covered at kernel level and by the N1 bit-exact decoder cross-check;
+an externally converted model would close them. Zero kernel defects
+in the sweep. Probe GGUFs, censuses, and per-run artifacts are
+archived on the test machine (`~/models/probe`, `~/n2-reports`).
+
+## 9. Generation headroom: the GEMV decision (N4)
+
+Measured ceiling (pthread triad, best of 5): **74 / 99 / 133 GB/s at
+2/4/8 threads**. Against the reference build's effective tg
+bandwidth (model bytes x tg rate, 8 threads):
+
+| formats | eff. GB/s | % of ceiling | GEMV verdict |
+|---|--:|--:|---|
+| IQ1_M 2.6, TQ1_0 3.4 | 2.6–3.4 | 2–3% | **build it** — vec_dot is compute-starved ~40x; 5–10x tg plausible |
+| IQ2/IQ3 grids | ~18 | 14% | worthwhile — 2–4x, Amdahl-bounded at 1.5B scale |
+| TQ2_0 | 21 | 16% | worthwhile, same bound |
+| Q2_K–Q5_1, IQ4_NL/XS (1.5B) | 29–51 | 25–40% | skip — per-token overhead dominates at this scale |
+| Q4_K 27B | ~65 | 49% | marginal — ≤1.5x even at ceiling; large models only |
+
+The 0015 dispatch fallback stays the right default everywhere (it
+never loses; post-guard MMA tg is within ±5% of reference on every
+probe, +16% on TQ2_0 from power10 codegen alone). The follow-up with
+real payoff is a qbit-style direct GEMV for the IQ1/TQ1 family
+specifically — the same design that already wins 4.6x on Q2_0.
+
+## 10. Reproducing
 
 ```
 scripts/build-bonsai-power.sh
