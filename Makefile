@@ -44,7 +44,7 @@ PROD_TESTS := \
 
 # ---- independent decoder cross-checks (vs vendored ggml dequantize_row) ----
 XCHECK_TESTS := \
-	$(BUILD)/xcheck_grid $(BUILD)/xcheck_iq4
+	$(BUILD)/xcheck_grid $(BUILD)/xcheck_iq4 $(BUILD)/xcheck_cache
 
 # ---- reference (design-history) suites ----
 REF_TESTS := \
@@ -99,6 +99,12 @@ $(BUILD)/xcheck_grid: src/xcheck_grid.cpp src/iq_grid_ppc_mma.cpp src/iq_grids.h
 
 $(BUILD)/xcheck_iq4: src/xcheck_iq4.cpp src/iq4_ppc_mma.cpp src/xcheck_ggml_ref.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -Wno-unused-function $< -o $@
+
+# cache policy at N > capacity — the regime both shipped cache defects
+# lived in.  Arch-independent; src/ppc_pack_cache.cpp is the canonical
+# copy that patch 0016 carries into ggml verbatim.
+$(BUILD)/xcheck_cache: src/xcheck_cache.cpp src/ppc_pack_cache.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -Wno-unused-function $< -o $@ -lpthread
 
 $(BUILD)/qbit_bench: src/qbit_ppc_mma_v4.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) -DQBIT4_BENCH $< -o $@
