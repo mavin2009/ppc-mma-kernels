@@ -623,6 +623,90 @@ extern "C" void grid_gemm_packed(int64_t m, int64_t n, int64_t k,
     }
 }
 
+// ---- packed GEMV, n = 1: GER over the cached tiles --------------------
+//
+// The two-row VSX GEMV lost to vec_dot because n = 1 on this machine
+// is issue-rate bound (VALIDATION-POWER10.md s9.2).  This kernel
+// attacks that constraint with the one unit that crushes instructions
+// per byte: each xvi8ger4pp retires 4 rows x 4 depth of dot product,
+// and the A-side tiles, per-chunk scales and 128-offset corrections
+// already sit decoded in the pack cache.  The activation group is
+// XOR-flipped and replicated across the GER's four columns (one perm
+// per depth group), so every accumulator lane holds the same answer;
+// the fixup gathers the four rows into lane form with two merges and
+// a permdi.  Roughly 62 instructions per 8-row x 32-deep chunk versus
+// ~190 for the same work through the per-format vec_dot.
+extern "C" void grid_gemv_packed(int64_t m, int64_t k, const void * PAv,
+                                 const block_q8_K * y, float * C,
+                                 int ith, int nth) {
+    const agrid_t * PA = (const agrid_t *)PAv;
+    const int64_t nt = rt(m), ns = sl(k), ncht = k/32;
+    const vuc flip = vec_splats((unsigned char)0x80);
+    const vuc zero = vec_splats((unsigned char)0);
+    static const vuc repl[4] = {
+        (vuc){ 0,1,2,3, 0,1,2,3, 0,1,2,3, 0,1,2,3 },
+        (vuc){ 4,5,6,7, 4,5,6,7, 4,5,6,7, 4,5,6,7 },
+        (vuc){ 8,9,10,11, 8,9,10,11, 8,9,10,11, 8,9,10,11 },
+        (vuc){ 12,13,14,15, 12,13,14,15, 12,13,14,15, 12,13,14,15 },
+    };
+    const int64_t tpt = (nt + nth - 1) / nth;
+    const int64_t t0 = (int64_t)ith * tpt;
+    const int64_t t1 = (t0 + tpt) < nt ? (t0 + tpt) : nt;
+
+    for (int64_t it = t0; it < t1; it++) {
+        vfl fin0 = vec_splats(0.0f);   // rows it*MR+0..3, lane-per-row
+        vfl fin1 = vec_splats(0.0f);   // rows it*MR+4..7
+        for (int64_t s = 0; s < ns; s++) {
+            const agrid_t * T = &PA[it*ns + s];
+            const int64_t c0 = s*KC_CH;
+            const int64_t nch = (ncht - c0) < KC_CH ? (ncht - c0) : KC_CH;
+            for (int64_t ch = 0; ch < nch; ch++) {
+                if (ch + 1 < nch) {
+                    __builtin_prefetch(T->v[ch + 1], 0, 3);
+                    __builtin_prefetch((const char *)T->v[ch + 1] + 128, 0, 3);
+                }
+                const int64_t gc = c0 + ch;
+                const int8_t * q8 = y[gc/8].qs + 32*(gc%8);
+                const vfl vdB = vec_splats(y[gc/8].d);
+                const vuc ylo = vec_xor(load16u(q8),      flip);
+                const vuc yhi = vec_xor(load16u(q8 + 16), flip);
+                __vector_quad acc0, acc1;
+                __builtin_mma_xxsetaccz(&acc0);
+                __builtin_mma_xxsetaccz(&acc1);
+                const vuc * a = T->v[ch];
+                for (int x = 0; x < 8; x++) {
+                    const vuc yg = vec_perm(x < 4 ? ylo : yhi, zero, repl[x & 3]);
+                    __builtin_mma_xvi8ger4pp(&acc0, a[2*x],     yg);
+                    __builtin_mma_xvi8ger4pp(&acc1, a[2*x + 1], yg);
+                }
+                {
+                    vsi rp[4];
+                    __builtin_mma_disassemble_acc(rp, &acc0);
+                    vui m01 = vec_mergeh((vui)rp[0], (vui)rp[1]);
+                    vui m23 = vec_mergeh((vui)rp[2], (vui)rp[3]);
+                    vsi lanes = (vsi)vec_xxpermdi(m01, m23, 0);
+                    vfl t = vec_sub(vec_ctf(lanes, 0), T->C128[ch][0]);
+                    fin0 = vec_madd(t, vec_mul(T->sA[ch][0], vdB), fin0);
+                }
+                {
+                    vsi rp[4];
+                    __builtin_mma_disassemble_acc(rp, &acc1);
+                    vui m01 = vec_mergeh((vui)rp[0], (vui)rp[1]);
+                    vui m23 = vec_mergeh((vui)rp[2], (vui)rp[3]);
+                    vsi lanes = (vsi)vec_xxpermdi(m01, m23, 0);
+                    vfl t = vec_sub(vec_ctf(lanes, 0), T->C128[ch][1]);
+                    fin1 = vec_madd(t, vec_mul(T->sA[ch][1], vdB), fin1);
+                }
+            }
+        }
+        const int64_t r0 = it*MR;
+        for (int r = 0; r < 4; r++) {
+            if (r0 + r < m)     C[r0 + r]     = fin0[r];
+            if (r0 + 4 + r < m) C[r0 + 4 + r] = fin1[r];
+        }
+    }
+}
+
 
 // ---- 16-deep chunk variant for per-16-scale formats ----
 
@@ -638,6 +722,103 @@ typedef struct {
     vuc v[KC_CH16][8];                    // 4 depth-steps x 2 colgroups
     vfl dB[KC_CH16][2];
 } bgrid16_t;
+
+// ---- packed GEMV for the 16-deep family (see grid_gemv_packed) --------
+//
+// The 16-deep chunks give each accumulator only FOUR GERs before the
+// fixup wants it drained, and xxmfacc serializes against that
+// accumulator's GER stream -- the engine never reaches a deep
+// pipeline (first cut measured 10 t/s where vec_dot does 33).  So
+// this kernel ping-pongs two accumulator sets across chunks: chunk
+// c+1's GERs issue on the idle set while chunk c drains and fixes up.
+// The same trade the 8x8 kernels measured at n = 8 is decisive here.
+static inline void grid16_gemv_issue(const agrid16_t * T, int64_t ch,
+                                     const block_q8_K * y, int64_t gc,
+                                     const vuc repl[4], vuc flip, vuc zero,
+                                     __vector_quad * a0, __vector_quad * a1) {
+    const int8_t * q8 = y[gc/16].qs + 16*(gc%16);
+    const vuc yv = vec_xor(load16u(q8), flip);
+    __builtin_mma_xxsetaccz(a0);
+    __builtin_mma_xxsetaccz(a1);
+    const vuc * a = T->v[ch];
+    for (int t = 0; t < 4; t++) {
+        const vuc yg = vec_perm(yv, zero, repl[t]);
+        __builtin_mma_xvi8ger4pp(a0, a[2*t],     yg);
+        __builtin_mma_xvi8ger4pp(a1, a[2*t + 1], yg);
+    }
+}
+
+static inline void grid16_gemv_fixup(const agrid16_t * T, int64_t ch,
+                                     const block_q8_K * y, int64_t gc,
+                                     __vector_quad * a0, __vector_quad * a1,
+                                     vfl * fin0, vfl * fin1) {
+    const vfl vdB = vec_splats(y[gc/16].d);
+    {
+        vsi rp[4];
+        __builtin_mma_disassemble_acc(rp, a0);
+        vui m01 = vec_mergeh((vui)rp[0], (vui)rp[1]);
+        vui m23 = vec_mergeh((vui)rp[2], (vui)rp[3]);
+        vsi lanes = (vsi)vec_xxpermdi(m01, m23, 0);
+        vfl t = vec_sub(vec_ctf(lanes, 0), T->C128[ch][0]);
+        *fin0 = vec_madd(t, vec_mul(T->sA[ch][0], vdB), *fin0);
+    }
+    {
+        vsi rp[4];
+        __builtin_mma_disassemble_acc(rp, a1);
+        vui m01 = vec_mergeh((vui)rp[0], (vui)rp[1]);
+        vui m23 = vec_mergeh((vui)rp[2], (vui)rp[3]);
+        vsi lanes = (vsi)vec_xxpermdi(m01, m23, 0);
+        vfl t = vec_sub(vec_ctf(lanes, 0), T->C128[ch][1]);
+        *fin1 = vec_madd(t, vec_mul(T->sA[ch][1], vdB), *fin1);
+    }
+}
+
+extern "C" void grid16_gemv_packed(int64_t m, int64_t k, const void * PAv,
+                                   const block_q8_K * y, float * C,
+                                   int ith, int nth) {
+    const agrid16_t * PA = (const agrid16_t *)PAv;
+    const int64_t nt = rt(m), ns = sl(k), ncht = k/16;
+    const vuc flip = vec_splats((unsigned char)0x80);
+    const vuc zero = vec_splats((unsigned char)0);
+    static const vuc repl[4] = {
+        (vuc){ 0,1,2,3, 0,1,2,3, 0,1,2,3, 0,1,2,3 },
+        (vuc){ 4,5,6,7, 4,5,6,7, 4,5,6,7, 4,5,6,7 },
+        (vuc){ 8,9,10,11, 8,9,10,11, 8,9,10,11, 8,9,10,11 },
+        (vuc){ 12,13,14,15, 12,13,14,15, 12,13,14,15, 12,13,14,15 },
+    };
+    const int64_t tpt = (nt + nth - 1) / nth;
+    const int64_t t0 = (int64_t)ith * tpt;
+    const int64_t t1 = (t0 + tpt) < nt ? (t0 + tpt) : nt;
+
+    for (int64_t it = t0; it < t1; it++) {
+        vfl fin0 = vec_splats(0.0f);
+        vfl fin1 = vec_splats(0.0f);
+        for (int64_t s = 0; s < ns; s++) {
+            const agrid16_t * T = &PA[it*ns + s];
+            const int64_t c0 = s*KC_CH16;
+            const int64_t nch = (ncht - c0) < KC_CH16 ? (ncht - c0) : KC_CH16;
+            if (nch <= 0) continue;
+            __vector_quad accP0, accP1, accQ0, accQ1;
+            grid16_gemv_issue(T, 0, y, c0, repl, flip, zero, &accP0, &accP1);
+            int p = 1;
+            for (int64_t ch = 0; ch < nch; ch++) {
+                if (ch + 2 < nch) __builtin_prefetch(T->v[ch + 2], 0, 3);
+                if (ch + 1 < nch) {
+                    if (p) grid16_gemv_issue(T, ch + 1, y, c0 + ch + 1, repl, flip, zero, &accQ0, &accQ1);
+                    else   grid16_gemv_issue(T, ch + 1, y, c0 + ch + 1, repl, flip, zero, &accP0, &accP1);
+                }
+                if (p) grid16_gemv_fixup(T, ch, y, c0 + ch, &accP0, &accP1, &fin0, &fin1);
+                else   grid16_gemv_fixup(T, ch, y, c0 + ch, &accQ0, &accQ1, &fin0, &fin1);
+                p ^= 1;
+            }
+        }
+        const int64_t r0 = it*MR;
+        for (int r = 0; r < 4; r++) {
+            if (r0 + r < m)     C[r0 + r]     = fin0[r];
+            if (r0 + 4 + r < m) C[r0 + 4 + r] = fin1[r];
+        }
+    }
+}
 
 extern "C" size_t grid16_apack_size(int64_t m, int64_t k) {
     return (((size_t)(rt(m) * sl(k)) * sizeof(agrid16_t)) + 63) & ~(size_t)63;
@@ -952,6 +1133,25 @@ static int run(const char * name) {
         printf("%-8s m=%3lld n=%3lld k=%5lld  err=%.3g  %s\n",
                name, (long long)m,(long long)n,(long long)k, emax, ok?"OK":"FAIL");
         if (!ok) fails++;
+        {   // n = 1 packed GEMV against the same reference
+            float * Cg = (float*)aligned_alloc(64, ((m*sizeof(float))+63)&~63ul);
+            grid_gemv_packed(m, k, PA, B, Cg, 0, 3);
+            grid_gemv_packed(m, k, PA, B, Cg, 1, 3);
+            grid_gemv_packed(m, k, PA, B, Cg, 2, 3);
+            double gmax = 0, gscale = 0;
+            for (int64_t i = 0; i < m; i++) {
+                double ref = dref<BLK, DEC>(k, A + i*lda, B);
+                gscale += fabs(ref);
+                double e = fabs((double)Cg[i] - ref);
+                if (e > gmax) gmax = e;
+            }
+            gscale = gscale/m + 1e-30; gmax /= gscale;
+            bool gok = gmax < 1e-5;
+            printf("%-8s gemv m=%3lld k=%5lld  err=%.3g  %s\n",
+                   name, (long long)m, (long long)k, gmax, gok?"OK":"FAIL");
+            if (!gok) fails++;
+            free(Cg);
+        }
         free(A); free(B); free(C); free(PA); free(PB);
     }
     return fails;
@@ -1045,6 +1245,35 @@ static int run16(const char * name) {
         printf("%-8s m=%3lld n=%3lld k=%5lld  err=%.3g  %s\n",
                name, (long long)m,(long long)n,(long long)k, emax, ok?"OK":"FAIL");
         if (!ok) fails++;
+        {   // n = 1 packed GEMV against the same reference
+            float * Cg = (float*)aligned_alloc(64, ((m*sizeof(float))+63)&~63ul);
+            grid16_gemv_packed(m, k, PA, B, Cg, 0, 3);
+            grid16_gemv_packed(m, k, PA, B, Cg, 1, 3);
+            grid16_gemv_packed(m, k, PA, B, Cg, 2, 3);
+            double gmax = 0, gscale = 0;
+            for (int64_t i = 0; i < m; i++) {
+                double ref = 0;
+                for (int64_t sb = 0; sb < k/QK_K; sb++) {
+                    DEC(&A[i*lda + sb], code, sc);
+                    double bacc = 0;
+                    for (int c = 0; c < 16; c++) {
+                        long P = 0;
+                        for (int l = 0; l < 16; l++) P += (long)code[16*c + l] * B[sb].qs[16*c + l];
+                        bacc += (double)sc[c] * (double)P;
+                    }
+                    ref += (double)B[sb].d * bacc;
+                }
+                gscale += fabs(ref);
+                double e = fabs((double)Cg[i] - ref);
+                if (e > gmax) gmax = e;
+            }
+            gscale = gscale/m + 1e-30; gmax /= gscale;
+            bool gok = gmax < 1e-5;
+            printf("%-8s gemv m=%3lld k=%5lld  err=%.3g  %s\n",
+                   name, (long long)m, (long long)k, gmax, gok?"OK":"FAIL");
+            if (!gok) fails++;
+            free(Cg);
+        }
         free(A); free(B); free(C); free(PA); free(PB);
     }
     return fails;

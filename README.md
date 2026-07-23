@@ -107,8 +107,13 @@ follow-up experiments priced the remaining headroom honestly: token
 generation on this class of machine is issue-rate-bound, vec_dot is
 already near its optimum for every vectorized format, and the
 row-interleaved GEMV the analysis suggested measured 27–44% *slower*
-— built, tested, kept in-tree unwired as evidence
-(VALIDATION-POWER10.md §9.2). SMT4 is worth +11% on large models. Emulation
+— built, tested, kept in-tree unwired as evidence. What did work is
+the GER engine itself walking the cached tiles at n = 1: the grid
+GEMV (patch 0021) buys +23% to 3.1× generation for the formats whose
+vec_dot carries the highest per-byte instruction burden — TQ1_0,
+IQ1_S/M, IQ2_XXS, IQ3_XXS/S — and the dispatch routes every format
+to whichever path measured faster (VALIDATION-POWER10.md §9.2–9.3).
+SMT4 is worth +11% on large models. Emulation
 priced none of this, which is why 0.9.0 was labeled
 emulation-verified, why 1.0.0 was reserved for silicon, and why 1.0.0
 is now real. If you have a Power10 or Power11 machine —

@@ -328,6 +328,44 @@ wider SMT, Power11 — can re-run the experiment for the cost of one
 dispatch line. A hypothesis this thoroughly instrumented is worth
 keeping even when the machine votes no; especially then.
 
+### 9.3 The GEMV that worked: GER over the cached tiles
+
+§9.2's post-mortem pointed at the one unit that reduces instructions
+per byte instead of adding streams: the MMA engine. At n = 1 each
+`xvi8ger4pp` retires 4 rows × 4 depth of the dot product, and the
+A-side tiles, per-chunk scales and 128-offset corrections already sit
+decoded in the pack cache from prompt processing. `grid_gemv_packed`
+(32-deep) and `grid16_gemv_packed` (16-deep) walk those tiles with
+the activation group XOR-flipped and replicated across the GER's
+columns; a lane-gather fixup applies the same algebra as the GEMM
+kernels. 54 correctness checks against float64 references cover all
+nine grid formats at every shape (`make test`).
+
+Then every format was measured, and the dispatch routes **by
+evidence** (patch 0021), tg32 @8t:
+
+| format | n=1 path | before → after | vs its vec_dot |
+|---|---|--:|--:|
+| TQ1_0 | GER-GEMV | 20.5 → **30.7** | **3.1×** |
+| IQ2_XXS | GER-GEMV | 29.7 → **42.2** | +42% |
+| IQ1_S | GER-GEMV | 34.1 → **42.2** | +23% |
+| IQ3_XXS/S (IQ3_XS model) | GER-GEMV | 27.6 → **38.2** | +38% |
+| IQ1_M | GER-GEMV (16-deep) | 11.5 → 12.2 | +58% |
+| IQ2_M model (mixed) | IQ3_S→GEMV, IQ2_S→vec_dot | 35.7 → **37.7** | +5.5% |
+| TQ2_0, IQ2_S, IQ2_XS | vec_dot | unchanged | measured better |
+
+Two negatives are folded in deliberately: the 16-deep GEMV loses for
+formats with good vec_dots (per-16 scale traffic ≈ 4.8× native bytes;
+accumulator ping-pong was implemented and did not rescue it — the
+constraint is volume, not scheduling), and TQ2_0's vec_dot at 49.6
+t/s is simply excellent. Those formats keep vec_dot because the
+machine said so, not because the theory did. Prompt processing is
+untouched everywhere. Gates on the four affected models: IQ3_XS
+token-identical, TQ1_0/IQ1_M codegen-envelope, IQ2_M near-tie — all
+PASS. The instructions-per-byte model from §9.2 predicted this split
+and survives it: the GEMV wins exactly where vec_dot's per-byte
+instruction burden was highest, and nowhere else.
+
 ## 10. Remaining-work sweep (2026-07-22, late session)
 
 The four items the emulation era left open, closed on silicon:
