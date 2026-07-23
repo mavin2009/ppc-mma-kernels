@@ -285,9 +285,48 @@ streams live per thread — attacking the stream-restart class directly
 sixteen-codes lookup instead of ggml's scalar grid walk. Projected
 from the measured rates: +40–70% for 27B-class K-quants (65 → 90–110
 GB/s), 2–3× for the IQ2/IQ3/TQ2 class, bounded by the 3.5 ms floor at
-small scale. That is the GEMV worth building; nothing cheaper moves
-these numbers, and the two cheap ideas that suggested themselves are
-now measured dead ends.
+small scale. §9.2 built exactly that and put it on the machine; the
+projection did not survive contact.
+
+### 9.2 The GEMV experiment: hypothesis falsified, model corrected
+
+The two-row GEMV was built as specified — two interleaved weight
+streams, activation loads shared, per-row arithmetic copied
+instruction-for-instruction from ggml's POWER9 vec_dot so each row's
+result is bit-identical to the single-row path. It passes its
+float64-reference suite at every shape including odd tails
+(`q4_K gemv2` cases in `make test`). On silicon:
+
+| workload | vec_dot baseline | two-row GEMV | verdict |
+|---|--:|--:|---|
+| Q4_K 27B, tg32 @8t | 3.86 t/s | 2.82 | **−27%** |
+| Q4_K_S 1.7B, tg32 @8t | 58.25 t/s | 32.76 | **−44%** |
+
+Adding back vec_dot's per-iteration prefetches and `__restrict` made
+it slightly worse (2.71). The disassembly explains it: the two-row
+loop compiles to 622 instructions against 236 for the single-row
+vec_dot — ~30% more work per row-pair, plus spill traffic — and the
+machine is **issue-rate-bound, not latency-bound**, at n = 1.
+
+That correction makes the whole table in §9.1 coherent under one
+model: effective bandwidth tracks instructions-per-weight-byte,
+format by format. ggml's q4_K vec_dot runs ~0.83 instructions per
+weight byte and reaches ~60 GB/s; the iq2_s vec_dot — which is
+already properly vectorized (64-bit grid gathers, vec_perm sign
+expansion), contrary to §9.1's "scalar grid walk" assumption — runs
+~2.1 and reaches ~21 GB/s. Same ratio, measured twice. There is no
+2–3× hiding in the grid class; its vec_dot is near its issue-rate
+optimum, like every other vectorized format.
+
+What stands after falsification: SMT4 for large models (+11%, the one
+confirmed lever); patch 0017's wins for IQ1_M/TQ1_0 (real because
+those formats' fallbacks genuinely were compute-starved scalar);
+and per-thread parity with vec_dot everywhere else — now *understood*
+as the practical ceiling rather than asserted. The gemv2 kernel and
+its test stay in-tree, unwired (patch 0020), so different silicon —
+wider SMT, Power11 — can re-run the experiment for the cost of one
+dispatch line. A hypothesis this thoroughly instrumented is worth
+keeping even when the machine votes no; especially then.
 
 ## 10. Remaining-work sweep (2026-07-22, late session)
 

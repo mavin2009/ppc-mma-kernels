@@ -74,12 +74,12 @@ MMA path.
 
 ## What is verified, and what is not
 
-Correctness is proven the boring way: thirteen kernel suites (fourteen
-counting the ping-pong variant) against exact float64 references on
+Correctness is proven the boring way: thirteen kernel suites (fifteen
+counting the ping-pong and lxvp variants) against exact float64 references on
 random data, ragged shapes, multi-slab depths and n=1, built with
 -Wall -Wextra -Werror — run under qemu-power10 on every push and now
 also natively on POWER10, where all suites and UBSan come up clean.
-The fifteen integration patches are gated: every push proves the
+The twenty integration patches are gated: every push proves the
 series applies in sequence on a pristine checkout of the pinned fork
 commit and reproduces the build-verified tree byte for byte. I added
 that gate after shipping a broken series once. The defect log in
@@ -102,7 +102,13 @@ int8-expansion bandwidth tax, both found by their thread-scaling
 signature and fixed the same day (patch 0015: bigger cache, and
 below one column tile the dispatch hands generation back to
 vec_dot). Post-fix, generation is at reference parity or better for
-every format tested and qbit formats keep their 4.4× win. Emulation
+every format tested, qbit formats keep their 4.4× win, and the
+follow-up experiments priced the remaining headroom honestly: token
+generation on this class of machine is issue-rate-bound, vec_dot is
+already near its optimum for every vectorized format, and the
+row-interleaved GEMV the analysis suggested measured 27–44% *slower*
+— built, tested, kept in-tree unwired as evidence
+(VALIDATION-POWER10.md §9.2). SMT4 is worth +11% on large models. Emulation
 priced none of this, which is why 0.9.0 was labeled
 emulation-verified, why 1.0.0 was reserved for silicon, and why 1.0.0
 is now real. If you have a Power10 or Power11 machine —

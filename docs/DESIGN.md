@@ -326,9 +326,13 @@ identified as the one open engineering item (VALIDATION-POWER10.md
 while repack traits are declared per type; the trait surface is wide
 but mechanical.
 
-Sequencing decision: migrate family-by-family only after that
-family's GEMV exists, starting with qbit (whose GEMV already wins
-4.6×). Until then the dispatch-layer cache carries the load, and the
+Sequencing decision: migrate family-by-family only where a
+packed-layout n=1 story exists — today that is qbit (GEMV wins 4.6×)
+and IQ1_M/TQ1_0 (cached-pack path, patch 0017). For the vectorized
+vec_dot formats the GEMV experiment measured a loss
+(VALIDATION-POWER10.md §9.2), so their originals must stay resident
+and migration would mean double residency; they stay at the dispatch
+layer by evidence, not by default. Until then the dispatch-layer cache carries the load, and the
 pressures that motivated an early migration have been removed on
 silicon: first-touch packing is slice-parallel across the op's
 threads (patch 0019: 4.4 s → 1.05 s cold start on a 1.5B IQ2_M, with
