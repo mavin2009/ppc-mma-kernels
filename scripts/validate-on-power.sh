@@ -30,6 +30,13 @@ cd "$SRC"
 PROMPT="The three most important properties of a matrix multiplication kernel are"
 PORT=8971
 
+# Every run keeps its artifacts (generations, top-probs JSON, server
+# logs) in its own directory -- /tmp truncation destroyed the evidence
+# of a failing run once (VALIDATION-POWER10.md, defect D2 diagnosis).
+ART="$REPO_DIR/validation-runs/$(date +%Y%m%d-%H%M%S)-$(basename "$MODEL" .gguf)"
+mkdir -p "$ART"
+export ART
+
 # Refuse a squatted port. A pre-existing server here answers both
 # builds' health checks and completions, so the two outputs compare
 # equal no matter what the kernels compute -- a forged PASS. Field
@@ -103,8 +110,8 @@ cmake -B build-ref -DGGML_NATIVE=OFF -DCMAKE_C_FLAGS=-mcpu=power9 -DCMAKE_CXX_FL
 cmake --build build-ref -j"${JOBS:-$(nproc)}" --target llama-server llama-bench > /dev/null
 
 echo "[$(date +%H:%M:%S)] == temperature-0 comparison (two server starts + model loads; the scalar side is deliberately slow -- minutes each, not hung)"
-run_gen build-mma /tmp/out-mma.txt /tmp/server-mma.log
-run_gen build-ref /tmp/out-ref.txt /tmp/server-ref.log
+run_gen build-mma $ART/out-mma.txt $ART/server-mma.log
+run_gen build-ref $ART/out-ref.txt $ART/server-ref.log
 
 # The old check grepped the server banner for "MMA = 1", which failed
 # two ways at once in the field: this fork's system_info has no MMA
@@ -119,11 +126,11 @@ echo "   build-mma: $GER_MMA GER; build-ref: $GER_REF GER"
 [ "${GER_REF:-0}" -eq 0 ] || echo "WARNING: reference build contains GER instructions; baseline is not MMA-free."
 
 # preflight: fail LOUDLY, never silently
-for f in /tmp/out-mma.txt /tmp/out-ref.txt /tmp/out-mma.txt.json /tmp/out-ref.txt.json; do
+for f in $ART/out-mma.txt $ART/out-ref.txt $ART/out-mma.txt.json $ART/out-ref.txt.json; do
     if [ ! -s "$f" ]; then
         echo "ERROR: $f missing or empty -- generation phase failed."
-        echo "  server logs: /tmp/server-mma.log /tmp/server-ref.log"
-        echo "  raw responses: /tmp/out-*.txt.json"
+        echo "  server logs: $ART/server-mma.log $ART/server-ref.log"
+        echo "  raw responses: $ART/out-*.txt.json"
         T0="**INDETERMINATE** -- generation produced no output; see messages above"
     fi
 done
@@ -138,11 +145,12 @@ set +e   # nothing in the gate below may abort the script silently
 # numerical defect and fails.
 if [ -n "${T0:-}" ]; then
     : # preflight already decided
-elif diff -q /tmp/out-mma.txt /tmp/out-ref.txt > /dev/null; then
+elif diff -q $ART/out-mma.txt $ART/out-ref.txt > /dev/null; then
     T0="**PASS** -- MMA and scalar outputs are token-identical"
 else
     T0=$(python3 - << 'PYGATE'
-import json
+import json, os
+ART = os.environ["ART"]
 TOL = 0.10
 def toks(p):
     d = json.load(open(p))
@@ -158,7 +166,7 @@ def toks(p):
         out.append((chosen, m))
     return out
 try:
-    A, B = toks("/tmp/out-mma.txt.json"), toks("/tmp/out-ref.txt.json")
+    A, B = toks(ART + "/out-mma.txt.json"), toks(ART + "/out-ref.txt.json")
     import math
     def lp(v):
         return math.log(max(v, 1e-30)) if 0 <= v <= 1 else v
@@ -170,12 +178,12 @@ try:
         if da <= TOL and db <= TOL:
             print(f"**PASS (near-tie)** -- first divergence at token {i}: the two candidates sit within {max(da,db):.4f} logprob in both builds (tolerance {TOL}); consistent with reduction-order rounding between MMA and the VSX reference, not a kernel defect")
         else:
-            print(f"**FAIL** -- divergence at token {i} with logprob gaps {da:.3f}/{db:.3f} (tolerance {TOL}): a real numerical defect; do NOT deploy; attach /tmp/out-*.txt.json to an issue")
+            print(f"**FAIL** -- divergence at token {i} with logprob gaps {da:.3f}/{db:.3f} (tolerance {TOL}): a real numerical defect; do NOT deploy; attach the run directory under validation-runs/ to an issue")
         break
     else:
         print("**PASS** -- token streams identical over compared span")
 except Exception as e:
-    print(f"**INDETERMINATE** -- gate analysis failed ({e}); attach /tmp/out-*.txt.json to an issue")
+    print(f"**INDETERMINATE** -- gate analysis failed ({e}); attach the run directory under validation-runs/ to an issue")
 PYGATE
 )
 fi
@@ -198,9 +206,10 @@ case "$T0" in *"**FAIL**"*)
         cmake --build build-ref8 -j"${JOBS:-$(nproc)}" --target llama-server > /dev/null 2>&1
     fi
     if [ -x build-ref8/bin/llama-server ]; then
-        run_gen build-ref8 /tmp/out-ref8.txt /tmp/server-ref8.log
+        run_gen build-ref8 $ART/out-ref8.txt $ART/server-ref8.log
         T0=$(python3 - << 'PYCTL'
-import json, math
+import json, math, os
+ART = os.environ["ART"]
 def toks(p):
     d = json.load(open(p)); seq = []
     for t in d.get("completion_probabilities", []):
@@ -221,20 +230,20 @@ def drift(A, B):
     ds.sort()
     return (ds[len(ds)//2] if ds else None), flip
 try:
-    M  = toks("/tmp/out-mma.txt.json")
-    R9 = toks("/tmp/out-ref.txt.json")
-    R8 = toks("/tmp/out-ref8.txt.json")
+    M  = toks(ART + "/out-mma.txt.json")
+    R9 = toks(ART + "/out-ref.txt.json")
+    R8 = toks(ART + "/out-ref8.txt.json")
     m9, _ = drift(M, R9)
     c, ctl_flip = drift(R9, R8)
     if m9 is None:
-        print("**INDETERMINATE** -- MMA and reference diverge at token 0; no span to measure. Attach /tmp/out-*.txt.json to an issue.")
+        print("**INDETERMINATE** -- MMA and reference diverge at token 0; no span to measure. Attach the run directory under validation-runs/ to an issue.")
     elif ctl_flip or (c is not None and c > 0 and m9 <= 2 * c):
         extra = " and itself flips a token" if ctl_flip else ""
         print(f"**PASS (codegen envelope)** -- the tier-2 divergence lies within this machine's cross-codegen rounding envelope: MMA vs power9-reference median logprob drift {m9:.3f}; the MMA-free power8-vs-power9 control pair drifts {(c if c is not None else float('nan')):.3f}{extra}. Two builds containing none of this repo's code behave the same way, so the divergence does not indict the kernels.")
     else:
-        print(f"**FAIL (control-confirmed)** -- MMA drift median {m9:.3f} exceeds twice the MMA-free control envelope {c:.3f}: the divergence is specific to the MMA path. A real numerical defect; do NOT deploy; attach /tmp/out-*.txt.json to an issue.")
+        print(f"**FAIL (control-confirmed)** -- MMA drift median {m9:.3f} exceeds twice the MMA-free control envelope {c:.3f}: the divergence is specific to the MMA path. A real numerical defect; do NOT deploy; attach the run directory under validation-runs/ to an issue.")
 except Exception as e:
-    print(f"**INDETERMINATE** -- envelope analysis failed ({e}); attach /tmp/out-*.txt.json to an issue")
+    print(f"**INDETERMINATE** -- envelope analysis failed ({e}); attach the run directory under validation-runs/ to an issue")
 PYCTL
 )
     else
@@ -263,7 +272,7 @@ cat > "$REPO_DIR/validation-report.md" << REPORT
 - Machine: $(grep -m1 model /proc/cpuinfo 2>/dev/null || uname -m), $(nproc) threads
 - Kernel/OS: $(uname -sr)
 - Model: $(basename "$MODEL") ($(du -h "$MODEL" | cut -f1))
-- Repo: $(cd "$REPO_DIR" && git describe --tags --always 2>/dev/null)
+- Repo: $(cd "$REPO_DIR" && { git describe --tags --always 2>/dev/null || echo "untracked tree, src sha $(cat src/*.cpp src/*.h scripts/validate-on-power.sh 2>/dev/null | sha256sum | cut -c1-12)"; })
 - Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 ## Temperature-0 check
@@ -279,8 +288,17 @@ $BM
 $BR
 \`\`\`
 REPORT
-diff /tmp/out-mma.txt /tmp/out-ref.txt >> "$REPO_DIR/validation-report.md" 2>/dev/null || true
+diff $ART/out-mma.txt $ART/out-ref.txt >> "$REPO_DIR/validation-report.md" 2>/dev/null || true
 
 echo
 echo "Report written: $REPO_DIR/validation-report.md"
+echo "Artifacts kept:  $ART"
+
 echo "Please share it: https://github.com/mavin2009/ppc-mma-kernels/issues/new?template=hardware-result.md"
+
+# Exit status mirrors the gate so CI and runners need not grep prose:
+# 0 = PASS (any tier), 1 = FAIL, 2 = INDETERMINATE.
+case "$T0" in
+    *"**FAIL"*)          exit 1 ;;
+    *"**INDETERMINATE"*) exit 2 ;;
+esac
