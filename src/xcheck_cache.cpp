@@ -81,6 +81,48 @@ int main() {
     ppc_apack_cache_publish(backing[0], 8, 64, 3);
     printf("reload:   fingerprint forces repack on content change\n");
 
+    // ---- 4. parallel first touch: all threads fill, none proceeds early ----
+    {
+        static uint8_t src[64];
+        for (int j = 0; j < 64; j++) src[j] = (uint8_t)(0xA0 ^ j);
+        const int NT = 8;
+        static pthread_t th[NT];
+        struct parg { int ith; void * buf; int fresh; };
+        static parg args[NT];
+        static uint8_t * shared;
+        auto worker = [](void * vp) -> void * {
+            parg * a = (parg *)vp;
+            int fresh = 0;
+            void * p = ppc_apack_cache_acquire_par(src, 64, 512, 9, 64 * 64, NT, &fresh);
+            a->buf = p; a->fresh = fresh;
+            if (p && fresh) {
+                int64_t i0, rows;
+                ppc_apack_slice(64, 8, a->ith, NT, &i0, &rows);
+                for (int64_t r = i0; r < i0 + rows; r++)
+                    memset((uint8_t *)p + r * 64, 0x55, 64);
+                ppc_apack_cache_slice_done(src, 64, 512, 9);
+                // returning from slice_done means the WHOLE pack is ready
+                for (int64_t r = 0; r < 64; r++)
+                    if (((uint8_t *)p)[r * 64] != 0x55) { a->fresh = -1; break; }
+            }
+            return NULL;
+        };
+        for (int i = 0; i < NT; i++) { args[i].ith = i; pthread_create(&th[i], NULL, worker, &args[i]); }
+        for (int i = 0; i < NT; i++) pthread_join(th[i], NULL);
+        int filled = 0;
+        for (int i = 0; i < NT; i++) {
+            expect(args[i].buf != NULL, "parallel acquire returns buffer");
+            expect(args[i].fresh != -1, "no thread proceeds past slice_done before pack is whole");
+            if (args[i].fresh == 1) filled++;
+            shared = (uint8_t *)args[i].buf;
+        }
+        expect(filled == NT, "every same-op thread joins the fill");
+        int fresh = 1;
+        void * p = ppc_apack_cache_acquire_par(src, 64, 512, 9, 64 * 64, NT, &fresh);
+        expect(p == shared && fresh == 0, "later op takes the ready hit");
+        printf("parallel: %d threads filled disjoint slices, whole-pack barrier held\n", filled);
+    }
+
     if (fails) { printf("CACHE TEST FAILED (%d)\n", fails); return 1; }
     printf("ALL CACHE POLICY TESTS PASSED\n");
     return 0;

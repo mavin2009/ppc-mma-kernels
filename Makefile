@@ -40,7 +40,8 @@ PROD_TESTS := \
 	$(BUILD)/qbit_test \
 	$(BUILD)/q2_k_test $(BUILD)/q3_k_test $(BUILD)/q4_k_test \
 	$(BUILD)/q5_k_test $(BUILD)/q6_k_test \
-	$(BUILD)/iq4_test $(BUILD)/legacy_test $(BUILD)/iq_grid_test $(BUILD)/iq_grid_pp_test
+	$(BUILD)/iq4_test $(BUILD)/legacy_test $(BUILD)/iq_grid_test $(BUILD)/iq_grid_pp_test \
+	$(BUILD)/iq_grid_lxvp_test
 
 # ---- independent decoder cross-checks (vs vendored ggml dequantize_row) ----
 XCHECK_TESTS := \
@@ -89,6 +90,10 @@ $(BUILD)/iq_grid_test: src/iq_grid_ppc_mma.cpp src/iq_grids.h | $(BUILD)
 # accumulator ping-pong variant (hardware experiment #1; see BENCHMARKS-QEMU.md)
 $(BUILD)/iq_grid_pp_test: src/iq_grid_ppc_mma.cpp src/iq_grids.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -DIQGRID_TEST -DIQGRID_PINGPONG $< -o $@
+
+# ISA 3.1 vector-pair loads (hardware experiment #2; DESIGN.md)
+$(BUILD)/iq_grid_lxvp_test: src/iq_grid_ppc_mma.cpp src/iq_grids.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -DIQGRID_TEST -DIQGRID_LXVP $< -o $@
 
 # ---- decoder cross-checks: repo decoders vs ggml's dequantize_row,
 # vendored verbatim from the pinned fork (scripts/extract-xcheck-ref.py).

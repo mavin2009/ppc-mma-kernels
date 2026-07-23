@@ -357,11 +357,20 @@ static void kernel_iq4_8x8(const aiq4_t * PA, const biq4_t * PB,
         const vuc * a = PA->v[ch];
         const vuc * y = PB->v[ch];
         if (ch + 1 < nch) {
-            // each chunk's packed panel spans two 128B lines; touch both
+#ifdef PPC_DCBT_LINES
+            // pre-experiment default: four explicit line touches
             __builtin_prefetch(PA->v[ch + 1], 0, 3);
             __builtin_prefetch((const char *)PA->v[ch + 1] + 128, 0, 3);
             __builtin_prefetch(PB->v[ch + 1], 0, 3);
             __builtin_prefetch((const char *)PB->v[ch + 1] + 128, 0, 3);
+#else
+            // dcbt TH=0b01000 stream hints: measured +13% pp128 on
+            // IQ4_XS silicon vs the four line touches above (hardware
+            // experiment #3, VALIDATION-POWER10.md); neutral on the
+            // K-quant kernels, so only this kernel flips its default.
+            __asm__ volatile("dcbt 0,%0,8" :: "r"(PA->v[ch + 1]));
+            __asm__ volatile("dcbt 0,%0,8" :: "r"(PB->v[ch + 1]));
+#endif
         }
         __vector_quad acc[2][2];
         for (int g = 0; g < 2; g++)
