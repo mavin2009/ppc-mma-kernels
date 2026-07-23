@@ -47,10 +47,11 @@ q4_K, iq_grid, iq_grid_pp and legacy suites.
 
 Interpretation: prompt processing wins 3.7–48× everywhere. Token
 generation wins 4.6× where ggml's fallback is scalar (qbit) and sits
-at parity or slightly better elsewhere — parity is the physical
-ceiling there, because generation is bandwidth-bound and, post-0015,
-both builds read native-width weights through vec_dot at n < 8 (the
-MMA build's edge is power10 codegen). See D3.
+at parity or slightly better elsewhere, because post-0015 both builds
+read native-width weights through vec_dot at n < 8. Parity with
+vec_dot is NOT the physical ceiling, though — §9.1 measures how far
+vec_dot itself sits below the memory wall, and what would close the
+gap. See D3.
 
 ## 3. Correctness methodology: the three-tier gate
 
@@ -244,6 +245,49 @@ never loses; post-guard MMA tg is within ±5% of reference on every
 probe, +16% on TQ2_0 from power10 codegen alone). The follow-up with
 real payoff is a qbit-style direct GEMV for the IQ1/TQ1 family
 specifically — the same design that already wins 4.6x on Q2_0.
+
+### 9.1 Near-tie generation: what is still on the table
+
+Topology first, because it bounds everything: this LPAR is **4
+physical cores × SMT2** (8 of 32 logical CPUs online), one NUMA node;
+triad holds at 133–137 GB/s from SMT2 through SMT8. Against that
+ceiling, the near-tie formats' generation streams look like this
+(matmul-only rate ≈ per-token time minus the ~3.5 ms fixed cost a
+1.5B model pays for attention/norms/barriers):
+
+| class | formats | matmul GB/s | of ceiling | binding constraint |
+|---|---|--:|--:|---|
+| decode-bound | IQ2_M, IQ3_XS, TQ2_0 | ~21 | 16% | grid lookups in vec_dot — the vec_perm decode this repo already uses at repack time is absent from ggml's row path |
+| stream-restart-bound | Q2_K–Q5_1, IQ4_NL/XS (1.5B) | 36–63 | 27–47% | k = 1536 rows are sub-KB reads; the stream never reaches steady state between vec_dot calls |
+| latency-bound | Q4_K 27B | 65 | 49% | long rows stream well but 8 SMT contexts on 4 cores cannot hide enough memory latency |
+
+Three experiments, two of them negative and kept deliberately:
+
+- **dcbt stream hints inside vec_dot** (per 144-byte superblock):
+  −4% to −20% across Q2_K/Q5_K/27B — re-declaring streams at row
+  granularity thrashes the hardware prefetcher. Rejected and
+  reverted. The same hint won +13% inside the packed GEMM (patch
+  0018), where a chunk stream is long; the contrast is the lesson.
+- **SMT4** (`ppc64_cpu --smt=4`, 16 threads): 27B tg 3.87 → **4.31
+  t/s (+11%)** — confirming the latency-hiding diagnosis — while 1.5B
+  models are flat to −13% (barrier cost scales with threads on small
+  ops). SMT8 adds nothing over SMT4 (4.35). Deployment guidance, not
+  a code change: SMT4 for large models, SMT2 for small.
+- **Fixed overhead floor:** at 1.5B scale, ~3.5 ms/token of
+  non-matmul work caps any conceivable tg at ~280 t/s; kernel work
+  cannot move that.
+
+What would actually close the gap is the same item the N4 decision
+already ranked first, now with sharper numbers: a **row-interleaved
+GEMV** (ggml's `nrc > 1` vec_dot mechanism) that keeps 2–4 weight
+streams live per thread — attacking the stream-restart class directly
+— and, for the grid formats, decodes through the repo's one-perm-per-
+sixteen-codes lookup instead of ggml's scalar grid walk. Projected
+from the measured rates: +40–70% for 27B-class K-quants (65 → 90–110
+GB/s), 2–3× for the IQ2/IQ3/TQ2 class, bounded by the 3.5 ms floor at
+small scale. That is the GEMV worth building; nothing cheaper moves
+these numbers, and the two cheap ideas that suggested themselves are
+now measured dead ends.
 
 ## 10. Remaining-work sweep (2026-07-22, late session)
 
