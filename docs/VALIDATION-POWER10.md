@@ -245,7 +245,19 @@ probe, +16% on TQ2_0 from power10 codegen alone). The follow-up with
 real payoff is a qbit-style direct GEMV for the IQ1/TQ1 family
 specifically — the same design that already wins 4.6x on Q2_0.
 
-## 10. Reproducing
+## 10. Remaining-work sweep (2026-07-22, late session)
+
+The four items the emulation era left open, closed on silicon:
+
+| item | outcome |
+|---|---|
+| n=1 beyond qbit | Per-format policy (patch 0017): IQ1_M and TQ1_0 — the two formats whose vec_dot is compute-starved — keep the cached packed path at n=1: tg 7.70 → **11.54** t/s (+50%) and 10.34 → **20.47** t/s (+98%). All other formats keep the 0015 vec_dot fallback, which the probe sweep showed never loses. The direct low-bit GEMV (§9) remains the way to go further. |
+| ISA 3.1: lxvp pairs | Implemented behind `-DIQGRID_LXVP`, benched: **rejected on silicon** — IQ2_M −1.2%, IQ3_XS −22%. The emulation-era rejection stands; the flag stays in-tree as documented negative space (patch 0018, hardware experiment #2). |
+| ISA 3.1: dcbt streams | Implemented behind a flag, benched: **+13% pp on IQ4_XS** (328 → 371 t/s) — now the iq4 kernel's default (`-DPPC_DCBT_LINES` restores line touches). Neutral on the K-quant kernels, whose flag stays off (patch 0018, hardware experiment #3). Masked GERs remain deferred: expected perf-neutral, a code-clarity trade only. |
+| Cold-start packing | First touch now slice-parallel across the op's threads (patch 0019, protocol unit-tested in `make test`): 1.5B IQ2_M cold start 4.43 s → **1.05 s**, plus an unplanned +6% steady-state pp from NUMA-friendly first-touch page placement. Grid decode was the pain point (~0.5 GB/s single-threaded); a large IQ model would have paid 30–60 s. |
+| Cache placement | Migration into ggml's repack buffer layer designed and deliberately sequenced *after* the GEMV work (DESIGN.md, final section): the repack layer replaces the original layout, and the small-n policy needs original blocks until a packed-layout vec_dot exists. The pressures for early migration are gone (0016/0019). |
+
+## 11. Reproducing
 
 ```
 scripts/build-bonsai-power.sh

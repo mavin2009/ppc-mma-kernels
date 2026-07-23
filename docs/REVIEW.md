@@ -93,20 +93,25 @@ in the key plus `ppc_apack_cache_clear()`; nth-fold per-thread
 activation-pack duplication → column-partitioned packing on cache hits
 (total pack work now equals exactly one pack).
 
-**Known, quantified, awaiting silicon:**
+**Known-at-emulation items, now answered on silicon** (details in
+VALIDATION-POWER10.md §10):
 - 16-deep chunk kernels run 13.5 non-GER instructions per GER vs 7.6
   for the 32-deep kernels — the per-16-scale formats' inherent fixup
-  tax, forced by their scale granularity. Hardware prices it; we only
-  counted it.
-- First touch of a tensor packs the full matrix on one thread while
-  peers wait — cold-start latency, amortized over the model lifetime.
-- `xvi8ger4pp` semantics were established under qemu; silicon
-  agreement is expected, and confirming it is precisely what the
-  temperature-0 check is for.
+  tax, forced by their scale granularity. Hardware priced it: those
+  formats' pp ratios are the lower ones in the sweep, as counted.
+- ~~First touch packs on one thread~~ — slice-parallel across the
+  op's threads since patch 0019 (cold start 4.4 s → 1.05 s on a 1.5B
+  IQ2_M; protocol unit-tested at `make test`).
+- `xvi8ger4pp` semantics: confirmed by every token-identity PASS.
 - fp32 output accumulation matches ggml's own vec_dot baseline; no
   extended-precision claim is made for very large k.
-- n = 1 takes the no-packing GEMV path for `Q1_0`/`Q2_0` only; other
-  formats run padded GEMM tiles at n = 1.
+- n = 1: qbit runs its no-packing GEMV (wins 4.6×); IQ1_M/TQ1_0 run
+  the cached packed path (patch 0017, +50%/+98% over vec_dot); every
+  other format hands n < 8 back to vec_dot (patch 0015), which
+  measured at parity or better everywhere.
+- ISA 3.1: lxvp rejected on silicon (−1 to −22%); dcbt stream hints
+  are the iq4 default (+13% pp); masked GERs stay a code-clarity
+  deferral (patch 0018).
 - The `lxvp` vector-pair experiment (DESIGN.md) regressed the static
   count via pair-split register moves that are near-free on real
   hardware — the one case where our own instrument is suspect, filed

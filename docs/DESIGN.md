@@ -297,3 +297,40 @@ benchmarking on silicon.
   formats' block size.
 - (retired in v4) GEMV path implemented; needs hardware benchmarking
   against the GEMM path to set the crossover point.
+
+## Landing the pack cache inside ggml's repack layer (design; deferred with reasons)
+
+The tensor-keyed pack cache lives at the dispatch layer
+(`llamafile_sgemm`) because that is where it could be built without
+touching ggml's buffer machinery. Its eventual home is the
+`repack.cpp` buffer-type mechanism ggml already uses on aarch64:
+weights repacked once at model load into a dedicated CPU buffer type,
+owned by the model, freed with it.
+
+What the migration buys: pack lifetime tied to the model instead of
+the process (no manual `ppc_apack_cache_clear()`, no cap heuristics —
+the pack is simply the tensor's storage); load-time packing that
+overlaps model I/O; and an end to double residency, since today the
+int8 pack (1.8–4.6× native weight bytes) lives alongside the mmap'd
+original.
+
+What blocks it, stated honestly: the repack buffer type *replaces*
+the original layout, and this project's small-n policy (patches
+0015/0017) deliberately routes generation through ggml's vec_dot,
+which needs the original blocks. Migrating a format therefore
+requires either keeping both layouts resident (recreating the
+double-residency problem inside the buffer) or providing a vec_dot
+over the packed layout — which is exactly the direct low-bit GEMV
+identified as the one open engineering item (VALIDATION-POWER10.md
+§9). The 21 accelerated types also share tile kernels across formats,
+while repack traits are declared per type; the trait surface is wide
+but mechanical.
+
+Sequencing decision: migrate family-by-family only after that
+family's GEMV exists, starting with qbit (whose GEMV already wins
+4.6×). Until then the dispatch-layer cache carries the load, and the
+pressures that motivated an early migration have been removed on
+silicon: first-touch packing is slice-parallel across the op's
+threads (patch 0019: 4.4 s → 1.05 s cold start on a 1.5B IQ2_M, with
+a free +6% steady-state pp from NUMA-friendly first touch), the slot
+table grows (0016), and a capacity refusal is loud instead of silent.
